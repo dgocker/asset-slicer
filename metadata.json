@@ -1,0 +1,10 @@
+{
+  "name": "Remix: Asset Slicer \u0026 SVG Vectorizer",
+  "description": "An intuitive mobile-friendly tool to upload images, automatically detect and slice multiple icons/logos, remove backgrounds, crop tightly, and convert them to scalable SVG vectors.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
