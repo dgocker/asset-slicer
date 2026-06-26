@@ -30,6 +30,7 @@ import {
   findConnectedComponentAt,
   trimTransparentMargins,
 } from "../utils/imageProcess";
+import { yieldToMain } from "../utils/taskQueue";
 
 function useDebounce<T>(value: T, delay: number): T {
   const [debouncedValue, setDebouncedValue] = useState<T>(value);
@@ -136,6 +137,7 @@ export default function Workspace({
   // Refs for navigation and layout measuring
   const baseWidthRef = useRef<number>(400);
   const baseHeightRef = useRef<number>(300);
+  const allTimeAutoSlicesRef = useRef<Slice[]>([]);
   const panStartRef = useRef<{
     x: number;
     y: number;
@@ -562,11 +564,13 @@ export default function Workspace({
         );
 
         const usedIds = new Set<string>();
+        const candidateSlices = [...existingAutoSlices, ...allTimeAutoSlicesRef.current];
+        
         const newSlices: Slice[] = rects.map((rect, idx) => {
           let bestMatch: Slice | null = null;
           let bestIoU = 0;
 
-          for (const ext of existingAutoSlices) {
+          for (const ext of candidateSlices) {
             if (usedIds.has(ext.id)) continue;
             // Intersection rectangle
             const x1 = Math.max(rect.x, ext.rect.x);
@@ -588,7 +592,7 @@ export default function Workspace({
             }
           }
 
-          if (bestMatch && bestIoU > 0.15) {
+          if (bestMatch && bestIoU > 0.01) {
             usedIds.add(bestMatch.id);
             return {
               id: bestMatch.id,
@@ -597,14 +601,20 @@ export default function Workspace({
             };
           }
 
-          const randomSuffix = Math.random().toString(36).substring(2, 7);
-          const newId = `slice-${idx}-${randomSuffix}`;
+          const newId = `slice-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
           return {
             id: newId,
             rect,
             label: `Объект ${idx + 1}`,
           };
         });
+
+        // Update the all-time memory with these new slices
+        const newSliceIds = new Set(newSlices.map(s => s.id));
+        allTimeAutoSlicesRef.current = [
+          ...newSlices,
+          ...allTimeAutoSlicesRef.current.filter(s => !newSliceIds.has(s.id))
+        ].slice(0, 50); // Keep last 50 in memory
 
         const allSlices = [...newSlices, ...manualSlices];
 
@@ -620,11 +630,15 @@ export default function Workspace({
       });
     } else {
       // Just keep manual/smart slices if auto detect is disabled
-      setSlices((prevSlices) =>
-        prevSlices.filter(
+      setSlices((prevSlices) => {
+        const filtered = prevSlices.filter(
           (s) => s.id.startsWith("custom-") || s.id.startsWith("smart-"),
-        ),
-      );
+        );
+        if (filtered.length === prevSlices.length && filtered.every((s, i) => s.id === prevSlices[i].id)) {
+          return prevSlices; // return original reference to prevent state update!
+        }
+        return filtered;
+      });
     }
   }, [
     originalImageData,
@@ -713,7 +727,7 @@ export default function Workspace({
       const propTol = tol + softness * 0.4; // Tightened propagation threshold to prevent crossing semi-transparent edge boundaries
 
       const pushPixel = (idx: number) => {
-        if (isBackground[idx] === 0 && brushMask[idx] !== 1) {
+        if (isBackground[idx] === 0 && mask[idx] !== 1) {
           const pxIdx = idx * 4;
           const r = data[pxIdx];
           const g = data[pxIdx + 1];
@@ -1454,185 +1468,262 @@ export default function Workspace({
   /**
    * Experimental "Local AI" feature to detect and erase fringing/halos around edges.
    */
-  const applyAIEdgeRefinement = () => {
+  const applyAIEdgeRefinement = async () => {
     if (!originalImageData || !processedImageData || !brushMask) return;
     setIsRefining(true);
 
-    // Use a small delay to let the UI render the loading state
-    setTimeout(() => {
+    // Yield to the event loop so the "loading" state can render
+    await yieldToMain();
+
+    try {
       pushToHistory(); // Save state before modifying
 
-      const width = originalImageData.width;
-      const height = originalImageData.height;
+        const width = originalImageData.width;
+        const height = originalImageData.height;
 
-      // Clone original image data so we can destructively apply color bleeding while allowing undo
-      const newOrigData = new ImageData(
-        new Uint8ClampedArray(originalImageData.data),
-        width,
-        height,
-      );
-      const origDataArray = newOrigData.data;
-      const procData = new Uint8ClampedArray(processedImageData.data);
+        // Clone original image data so we can destructively apply color bleeding while allowing undo
+        const newOrigData = new ImageData(
+          new Uint8ClampedArray(originalImageData.data),
+          width,
+          height,
+        );
+        const origDataArray = newOrigData.data;
+        const procData = new Uint8ClampedArray(processedImageData.data);
 
-      const newMask = new Uint8Array(brushMask);
+        const newMask = new Uint8Array(brushMask);
 
-      // We only need 2 passes: one to trim the absolute worst fringing,
-      // and a second to color-decontaminate the remaining soft edges.
-      const passes = 2;
-      const searchRadius = 5;
+        // We only need 2 passes: one to trim the absolute worst fringing,
+        // and a second to color-decontaminate the remaining soft edges.
+        const passes = 2;
+        const searchRadius = 5;
 
-      // --- OPTIMIZATION: Find bounding box of all non-transparent pixels ---
-      let minX = width,
-        minY = height,
-        maxX = 0,
-        maxY = 0;
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          if (procData[(y * width + x) * 4 + 3] > 0) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
+        // --- OPTIMIZATION: Find bounding box of all non-transparent pixels ---
+        let minX = width,
+          minY = height,
+          maxX = 0,
+          maxY = 0;
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            if (procData[(y * width + x) * 4 + 3] > 0) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
           }
         }
-      }
 
-      if (minX > maxX) {
-        setIsRefining(false);
-        return; // nothing to process
-      }
+        if (minX > maxX) {
+          return; // nothing to process
+        }
 
-      // Pad the bounding box to ensure our convolution filters have room
-      minX = Math.max(0, minX - searchRadius - 1);
-      maxX = Math.min(width - 1, maxX + searchRadius + 1);
-      minY = Math.max(0, minY - searchRadius - 1);
-      maxY = Math.min(height - 1, maxY + searchRadius + 1);
+        // Pad the bounding box to ensure our convolution filters have room
+        minX = Math.max(0, minX - searchRadius - 1);
+        maxX = Math.min(width - 1, maxX + searchRadius + 1);
+        minY = Math.max(0, minY - searchRadius - 1);
+        maxY = Math.min(height - 1, maxY + searchRadius + 1);
 
-      for (let pass = 0; pass < passes; pass++) {
-        const toErase: number[] = [];
-        const toRecolor: { idx: number; r: number; g: number; b: number }[] =
-          [];
-
-        // ONLY iterate over the bounding box
-        for (let y = minY; y <= maxY; y++) {
-          for (let x = minX; x <= maxX; x++) {
-            const idx = y * width + x;
-
-            // Only consider currently opaque pixels
-            if (procData[idx * 4 + 3] === 0) continue;
-
-            // Check if it's an edge pixel (has at least one transparent neighbor)
-            let isEdge = false;
-            let transparentNeighbors = 0;
-            for (let dy = -1; dy <= 1; dy++) {
-              for (let dx = -1; dx <= 1; dx++) {
-                if (dx === 0 && dy === 0) continue;
-                const nx = x + dx;
-                const ny = y + dy;
-                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                  if (procData[(ny * width + nx) * 4 + 3] === 0) {
-                    isEdge = true;
-                    transparentNeighbors++;
-                  }
-                }
+        // Precalculate background mask for original image once to avoid Math.sqrt or getColorDistance inside loops
+        const isOrigBg = new Uint8Array(width * height);
+        const origData = originalImageData.data;
+        if (transparentColor) {
+          const rKey = transparentColor.r;
+          const gKey = transparentColor.g;
+          const bKey = transparentColor.b;
+          const tolSqr = tolerance * tolerance;
+          for (let i = 0; i < width * height; i++) {
+            const a = origData[i * 4 + 3];
+            if (a === 0) {
+              isOrigBg[i] = 1;
+            } else {
+              const r = origData[i * 4];
+              const g = origData[i * 4 + 1];
+              const b = origData[i * 4 + 2];
+              const distSqr = (r - rKey) ** 2 + (g - gKey) ** 2 + (b - bKey) ** 2;
+              if (distSqr <= tolSqr) {
+                isOrigBg[i] = 1;
               }
             }
+          }
+        } else {
+          for (let i = 0; i < width * height; i++) {
+            if (origData[i * 4 + 3] === 0) {
+              isOrigBg[i] = 1;
+            }
+          }
+        }
 
-            if (isEdge) {
-              // Local analysis: find background and foreground color clusters
-              let fgR = 0,
-                fgG = 0,
-                fgB = 0,
-                fgCount = 0;
-              let bgR = 0,
-                bgG = 0,
-                bgB = 0,
-                bgCount = 0;
+        for (let pass = 0; pass < passes; pass++) {
+          const toErase: number[] = [];
+          const toRecolor: { idx: number; r: number; g: number; b: number }[] =
+            [];
 
-              for (let dy = -searchRadius; dy <= searchRadius; dy++) {
-                for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+          // ONLY iterate over the bounding box
+          for (let y = minY; y <= maxY; y++) {
+            if (y % 50 === 0) {
+              await yieldToMain();
+            }
+            for (let x = minX; x <= maxX; x++) {
+              const idx = y * width + x;
+
+              // Only consider currently opaque pixels
+              if (procData[idx * 4 + 3] === 0) continue;
+
+              // Check if it's an edge pixel (has at least one transparent neighbor)
+              let isEdge = false;
+              let transparentNeighbors = 0;
+              for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  if (dx === 0 && dy === 0) continue;
                   const nx = x + dx;
                   const ny = y + dy;
                   if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                    const nIdx = ny * width + nx;
-                    const alpha = procData[nIdx * 4 + 3];
-                    const r = origDataArray[nIdx * 4];
-                    const g = origDataArray[nIdx * 4 + 1];
-                    const b = origDataArray[nIdx * 4 + 2];
-
-                    if (alpha === 0) {
-                      bgR += r;
-                      bgG += g;
-                      bgB += b;
-                      bgCount++;
-                    } else {
-                      // Count strong foreground (pixels not on the very edge)
-                      if (dx !== 0 || dy !== 0) {
-                        fgR += r;
-                        fgG += g;
-                        fgB += b;
-                        fgCount++;
-                      }
+                    if (procData[(ny * width + nx) * 4 + 3] === 0) {
+                      isEdge = true;
+                      transparentNeighbors++;
                     }
                   }
                 }
               }
 
-              if (bgCount > 0 && fgCount > 0) {
-                const bgMeanR = bgR / bgCount;
-                const bgMeanG = bgG / bgCount;
-                const bgMeanB = bgB / bgCount;
+              if (isEdge) {
+                // 1. Boundary Guard: Limit refinement to pixels close to the original background area
+                let nearOrigBg = false;
+                const checkRadius = 4; // limit edge refinement strictly to 4px from original background
+                for (let dy = -checkRadius; dy <= checkRadius && !nearOrigBg; dy++) {
+                  for (let dx = -checkRadius; dx <= checkRadius; dx++) {
+                    const nx = x + dx;
+                    const ny = y + dy;
+                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                      if (isOrigBg[ny * width + nx] === 1) {
+                        nearOrigBg = true;
+                        break;
+                      }
+                    }
+                  }
+                }
 
-                const fgMeanR = fgR / fgCount;
-                const fgMeanG = fgG / fgCount;
-                const fgMeanB = fgB / fgCount;
+                // 2. Color Guard: Is the original color of this pixel a solid foreground color (extremely far from background key)?
+                const origR = originalImageData.data[idx * 4];
+                const origG = originalImageData.data[idx * 4 + 1];
+                const origB = originalImageData.data[idx * 4 + 2];
+                
+                let isSolidForeground = false;
+                if (transparentColor) {
+                  const limitVal = Math.max(120, tolerance + 50);
+                  const limitSqr = limitVal * limitVal;
+                  const distSqr = (origR - transparentColor.r) ** 2 + (origG - transparentColor.g) ** 2 + (origB - transparentColor.b) ** 2;
+                  isSolidForeground = distSqr > limitSqr;
+                }
 
-                const r = origDataArray[idx * 4];
-                const g = origDataArray[idx * 4 + 1];
-                const b = origDataArray[idx * 4 + 2];
+                // If it's deep inside the foreground body or is a solid foreground color, skip refining it!
+                if (!nearOrigBg || isSolidForeground) {
+                  continue;
+                }
 
-                // Distance to background vs foreground
-                const distBg = Math.sqrt(
-                  (r - bgMeanR) ** 2 + (g - bgMeanG) ** 2 + (b - bgMeanB) ** 2,
-                );
-                const distFg = Math.sqrt(
-                  (r - fgMeanR) ** 2 + (g - fgMeanG) ** 2 + (b - fgMeanB) ** 2,
-                );
+                // Local analysis: find background and foreground color clusters
+                let fgR = 0,
+                  fgG = 0,
+                  fgB = 0,
+                  fgCount = 0;
+                let bgR = 0,
+                  bgG = 0,
+                  bgB = 0,
+                  bgCount = 0;
 
-                // Smart Edge Logic
-                if (distBg < distFg * 0.5) {
-                  toErase.push(idx);
-                } else if (transparentNeighbors >= 5 && distBg < distFg * 0.8) {
-                  toErase.push(idx);
-                } else if (pass === passes - 1) {
-                  // In the final pass, instead of erasing, we BLEED the foreground color into the edge pixel!
-                  toRecolor.push({ idx, r: fgMeanR, g: fgMeanG, b: fgMeanB });
+                for (let dy = -searchRadius; dy <= searchRadius; dy++) {
+                  for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+                    const nx = x + dx;
+                    const ny = y + dy;
+                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                      const nIdx = ny * width + nx;
+                      const alpha = procData[nIdx * 4 + 3];
+                      const r = origDataArray[nIdx * 4];
+                      const g = origDataArray[nIdx * 4 + 1];
+                      const b = origDataArray[nIdx * 4 + 2];
+
+                      if (alpha === 0) {
+                        // Only count as background if it is reasonably close to the original chroma key background color,
+                        // to prevent eroded foreground pixels (which still exist in originalImageData but are marked as alpha 0)
+                        // from corrupting the background mean color towards foreground.
+                        let distToBgKeySqr = 0;
+                        if (transparentColor) {
+                          distToBgKeySqr = (r - transparentColor.r) ** 2 + (g - transparentColor.g) ** 2 + (b - transparentColor.b) ** 2;
+                        }
+                        
+                        if (!transparentColor || distToBgKeySqr < 14400) { // 120^2 = 14400
+                          bgR += r;
+                          bgG += g;
+                          bgB += b;
+                          bgCount++;
+                        }
+                      } else {
+                        // Count strong foreground (pixels not on the very edge)
+                        if (dx !== 0 || dy !== 0) {
+                          fgR += r;
+                          fgG += g;
+                          fgB += b;
+                          fgCount++;
+                        }
+                      }
+                    }
+                  }
+                }
+
+                if (bgCount > 0 && fgCount > 0) {
+                  const bgMeanR = bgR / bgCount;
+                  const bgMeanG = bgG / bgCount;
+                  const bgMeanB = bgB / bgCount;
+
+                  const fgMeanR = fgR / fgCount;
+                  const fgMeanG = fgG / fgCount;
+                  const fgMeanB = fgB / fgCount;
+
+                  const r = origDataArray[idx * 4];
+                  const g = origDataArray[idx * 4 + 1];
+                  const b = origDataArray[idx * 4 + 2];
+
+                  // Distance squared to background vs foreground
+                  const distBgSqr = (r - bgMeanR) ** 2 + (g - bgMeanG) ** 2 + (b - bgMeanB) ** 2;
+                  const distFgSqr = (r - fgMeanR) ** 2 + (g - fgMeanG) ** 2 + (b - fgMeanB) ** 2;
+
+                  // Smart Edge Logic
+                  if (distBgSqr < distFgSqr * 0.25) { // 0.5^2 = 0.25
+                    toErase.push(idx);
+                  } else if (transparentNeighbors >= 5 && distBgSqr < distFgSqr * 0.64) { // 0.8^2 = 0.64
+                    toErase.push(idx);
+                  } else if (pass === passes - 1) {
+                    // In the final pass, instead of erasing, we BLEED the foreground color into the edge pixel!
+                    toRecolor.push({ idx, r: fgMeanR, g: fgMeanG, b: fgMeanB });
+                  }
                 }
               }
             }
           }
+
+          for (const idx of toErase) {
+            newMask[idx] = 0; // Erase in brush mask
+            procData[idx * 4 + 3] = 0; // Temporarily update procData for next pass
+          }
+
+          for (const rc of toRecolor) {
+            // Permanently shift the color of the original image pixel so the halo is eliminated
+            origDataArray[rc.idx * 4] = rc.r;
+            origDataArray[rc.idx * 4 + 1] = rc.g;
+            origDataArray[rc.idx * 4 + 2] = rc.b;
+            newMask[rc.idx] = 1; // Force keep so we don't lose the recolored edge and block flood fill
+          }
+
+          if (toErase.length === 0 && toRecolor.length === 0) break;
         }
 
-        for (const idx of toErase) {
-          newMask[idx] = 0; // Erase in brush mask
-          procData[idx * 4 + 3] = 0; // Temporarily update procData for next pass
-        }
-
-        for (const rc of toRecolor) {
-          // Permanently shift the color of the original image pixel so the halo is eliminated
-          origDataArray[rc.idx * 4] = rc.r;
-          origDataArray[rc.idx * 4 + 1] = rc.g;
-          origDataArray[rc.idx * 4 + 2] = rc.b;
-          newMask[rc.idx] = 1; // Force keep so we don't lose the recolored edge and block flood fill
-        }
-
-        if (toErase.length === 0 && toRecolor.length === 0) break;
+        setOriginalImageData(newOrigData); // Save the color-decontaminated image
+        setBrushMask(newMask); // Triggers processPixels automatically
+      } catch (err) {
+        console.error("Error during AI edge refinement:", err);
+      } finally {
+        setIsRefining(false);
       }
-
-      setOriginalImageData(newOrigData); // Save the color-decontaminated image
-      setBrushMask(newMask); // Triggers processPixels automatically
-      setIsRefining(false);
-    }, 50);
   };
 
   /**

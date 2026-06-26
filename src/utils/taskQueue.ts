@@ -1,13 +1,18 @@
 let currentTask = Promise.resolve();
 
-export function enqueueHeavyTask<T>(task: () => T): Promise<T> {
+export function yieldToMain(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+export function enqueueHeavyTask<T>(task: () => T | Promise<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     currentTask = currentTask.then(() => {
       return new Promise<void>((innerResolve) => {
         // Yield to the browser before starting the task
-        setTimeout(() => {
+        setTimeout(async () => {
           try {
-            resolve(task());
+            const result = await task();
+            resolve(result);
           } catch (e) {
             reject(e);
           } finally {
@@ -19,3 +24,4 @@ export function enqueueHeavyTask<T>(task: () => T): Promise<T> {
     });
   });
 }
+

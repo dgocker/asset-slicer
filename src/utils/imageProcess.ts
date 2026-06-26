@@ -162,11 +162,10 @@ export function detectBackgroundColor(imageData: ImageData): ColorRGB {
  * Calculates color distance in RGB space.
  */
 export function getColorDistance(c1: ColorRGB, c2: ColorRGB): number {
-  return Math.sqrt(
-    Math.pow(c1.r - c2.r, 2) +
-    Math.pow(c1.g - c2.g, 2) +
-    Math.pow(c1.b - c2.b, 2)
-  );
+  const dr = c1.r - c2.r;
+  const dg = c1.g - c2.g;
+  const db = c1.b - c2.b;
+  return Math.sqrt(dr * dr + dg * dg + db * db);
 }
 
 /**
@@ -624,55 +623,47 @@ export function generateColorLayersSvg(imageData: ImageData, targetColorsCount =
     return `#${toHex(c.r)}${toHex(c.g)}${toHex(c.b)}`;
   };
 
-  // For each quantized color, trace its mask contours
-  let svgPaths = '';
+  // Pre-allocate masks for each color
+  const colorMasks = sortedColors.map(() => new Uint8ClampedArray(width * height * 4));
 
-  sortedColors.forEach(color => {
-    // Create a temporary binary ImageData mask for this color layer
-    const maskData = new Uint8ClampedArray(width * height * 4);
-    
-    for (let i = 0; i < data.length; i += 4) {
-      const a = data[i + 3];
-      if (a < 100) continue;
+  // Single pass to assign each pixel to its closest color mask
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3];
+    if (a < 100) continue;
 
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
 
-      // Calculate distance to this target color
-      const dist = Math.sqrt(
-        Math.pow(r - color.r, 2) +
-        Math.pow(g - color.g, 2) +
-        Math.pow(b - color.b, 2)
-      );
+    let bestColorIdx = -1;
+    let minDist = Infinity;
 
-      // Check if this pixel is closer to 'color' than any other color in the palette
-      let isClosest = true;
-      let minDist = dist;
-
-      for (let j = 0; j < sortedColors.length; j++) {
-        const otherColor = sortedColors[j];
-        if (otherColor === color) continue;
-        const oDist = Math.sqrt(
-          Math.pow(r - otherColor.r, 2) +
-          Math.pow(g - otherColor.g, 2) +
-          Math.pow(b - otherColor.b, 2)
-        );
-        if (oDist < minDist) {
-          minDist = oDist;
-          isClosest = false;
-          break;
-        }
-      }
-
-      if (isClosest && dist < 120) {
-        maskData[i] = color.r;
-        maskData[i + 1] = color.g;
-        maskData[i + 2] = color.b;
-        maskData[i + 3] = 255;
+    for (let j = 0; j < sortedColors.length; j++) {
+      const color = sortedColors[j];
+      const dist = (r - color.r) * (r - color.r) + 
+                   (g - color.g) * (g - color.g) + 
+                   (b - color.b) * (b - color.b); // Compare squared distance
+      if (dist < minDist) {
+        minDist = dist;
+        bestColorIdx = j;
       }
     }
 
+    if (bestColorIdx !== -1 && minDist < 14400) { // 120^2
+      const maskData = colorMasks[bestColorIdx];
+      const color = sortedColors[bestColorIdx];
+      maskData[i] = color.r;
+      maskData[i + 1] = color.g;
+      maskData[i + 2] = color.b;
+      maskData[i + 3] = 255;
+    }
+  }
+
+  // For each quantized color, trace its mask contours
+  let svgPaths = '';
+
+  sortedColors.forEach((color, idx) => {
+    const maskData = colorMasks[idx];
     const maskImgData = new ImageData(maskData, width, height);
     const contours = traceContours(maskImgData, 120);
 
