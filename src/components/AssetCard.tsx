@@ -37,110 +37,112 @@ const AssetCard = React.memo(function AssetCard({ slice, processedImageData, ori
 
     let isSubscribed = true;
 
-    // Use enqueueHeavyTask to ensure that if many AssetCards mount simultaneously,
-    // they don't block the main thread and freeze the browser.
-    enqueueHeavyTask(async () => {
-      if (!isSubscribed) return;
+    // Debounce processing by 250ms to prevent main thread freezing during active brushing or slider dragging.
+    const timer = setTimeout(() => {
+      enqueueHeavyTask(async () => {
+        if (!isSubscribed) return;
 
-      // 1. Trim margins tightly around the slice for a clean close-cropped asset bounding box
-      const tightRect = trimMargins 
-        ? trimTransparentMargins(processedImageData, slice.rect)
-        : slice.rect;
-      
-      // Safety check for empty regions
-      if (tightRect.width <= 0 || tightRect.height <= 0) return;
-      
-      // 2. Extract cropped PNG from processed/original ImageData
-      const sourceData = (keepBackground && originalImageData) ? originalImageData : processedImageData;
-      const croppedImgData = cropImageData(sourceData, tightRect);
-      
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = tightRect.width;
-      tempCanvas.height = tightRect.height;
-      const tempCtx = tempCanvas.getContext('2d');
-      if (!tempCtx) return;
-      
-      tempCtx.putImageData(croppedImgData, 0, 0);
-
-      // Apply Smart Edge Cleanup
-      if (smartEdge) {
-        applySmartEdgeCleanup(croppedImgData, erodeAmount, keyColor);
+        // 1. Trim margins tightly around the slice for a clean close-cropped asset bounding box
+        const tightRect = trimMargins 
+          ? trimTransparentMargins(processedImageData, slice.rect)
+          : slice.rect;
+        
+        // Safety check for empty regions
+        if (tightRect.width <= 0 || tightRect.height <= 0) return;
+        
+        // 2. Extract cropped PNG from processed/original ImageData
+        const sourceData = (keepBackground && originalImageData) ? originalImageData : processedImageData;
+        const croppedImgData = cropImageData(sourceData, tightRect);
+        
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = tightRect.width;
+        tempCanvas.height = tightRect.height;
+        const tempCtx = tempCanvas.getContext('2d');
+        if (!tempCtx) return;
+        
         tempCtx.putImageData(croppedImgData, 0, 0);
-      }
 
-      const pngDataUrl = tempCanvas.toDataURL('image/png');
-
-      // Generate compressed base64 string
-      const embedDataUrl = embedFormat === 'webp'
-        ? tempCanvas.toDataURL('image/webp', embedQuality / 100)
-        : pngDataUrl;
-
-      // 4. Generate the active SVG vectorization format (lazy calculation to prevent thread blocking)
-      let currentSvgCode = '';
-      let silhouetteSvg = '';
-      let colorSvg = '';
-      let embeddedSvg = '';
-
-      if (svgMode === 'silhouette') {
-        silhouetteSvg = generateSilhouetteSvg(croppedImgData, '#1e293b');
-        currentSvgCode = silhouetteSvg;
-      } else if (svgMode === 'color') {
-        colorSvg = generateColorLayersSvg(croppedImgData, 4);
-        currentSvgCode = colorSvg;
-      } else {
-        embeddedSvg = generateEmbeddedSvg(tightRect.width, tightRect.height, embedDataUrl);
-        currentSvgCode = embeddedSvg;
-      }
-
-      // Set default name if empty or generic
-      const currentName = assetName || slice.label.toLowerCase().replace(/\s+/g, '_');
-      if (!assetName && isSubscribed) {
-        setAssetName(currentName);
-      }
-
-      // Determine dominant color representation
-      let domColor = '#4b5563';
-      // Sample a prominent pixel color for visual flair
-      const pixelData = croppedImgData.data;
-      for (let i = 0; i < pixelData.length; i += 4 * 10) {
-        if (pixelData[i + 3] > 150) {
-           const r = pixelData[i].toString(16).padStart(2, '0');
-           const g = pixelData[i + 1].toString(16).padStart(2, '0');
-           const b = pixelData[i + 2].toString(16).padStart(2, '0');
-           domColor = `#${r}${g}${b}`;
-           break;
+        // Apply Smart Edge Cleanup
+        if (smartEdge) {
+          applySmartEdgeCleanup(croppedImgData, erodeAmount, keyColor);
+          tempCtx.putImageData(croppedImgData, 0, 0);
         }
-      }
 
-      if (!isSubscribed) return;
+        const pngDataUrl = tempCanvas.toDataURL('image/png');
 
-      const newAsset: ProcessedAsset = {
-        id: slice.id,
-        name: currentName,
-        rect: tightRect,
-        pngDataUrl,
-        rasterDataUrl: embedDataUrl,
-        rasterFormat: embedFormat,
-        width: tightRect.width,
-        height: tightRect.height,
-        svgMode,
-        svgCode: currentSvgCode,
-        silhouetteSvg: silhouetteSvg || currentSvgCode,
-        colorSvg: colorSvg || currentSvgCode,
-        embeddedSvg: embeddedSvg || currentSvgCode,
-        dominantColor: domColor,
-        tags: [
-          `${tightRect.width}x${tightRect.height}px`,
-          svgMode === 'silhouette' ? 'Силуэт' : svgMode === 'color' ? 'Вектор (цвет)' : `SVG (${embedFormat.toUpperCase()})`
-        ]
-      };
+        // Generate compressed base64 string
+        const embedDataUrl = embedFormat === 'webp'
+          ? tempCanvas.toDataURL('image/webp', embedQuality / 100)
+          : pngDataUrl;
 
-      setProcessed(newAsset);
-      onAssetUpdated(newAsset);
-    });
+        // 4. Generate the active SVG vectorization format (lazy calculation to prevent thread blocking)
+        let currentSvgCode = '';
+        let silhouetteSvg = '';
+        let colorSvg = '';
+        let embeddedSvg = '';
+
+        if (svgMode === 'silhouette') {
+          silhouetteSvg = generateSilhouetteSvg(croppedImgData, '#1e293b');
+          currentSvgCode = silhouetteSvg;
+        } else if (svgMode === 'color') {
+          colorSvg = generateColorLayersSvg(croppedImgData, 4);
+          currentSvgCode = colorSvg;
+        } else {
+          embeddedSvg = generateEmbeddedSvg(tightRect.width, tightRect.height, embedDataUrl);
+          currentSvgCode = embeddedSvg;
+        }
+
+        // Set default name if empty or generic
+        const currentName = assetName || slice.label.toLowerCase().replace(/\s+/g, '_');
+        if (!assetName && isSubscribed) {
+          setAssetName(currentName);
+        }
+
+        // Determine dominant color representation
+        let domColor = '#4b5563';
+        // Sample a prominent pixel color for visual flair
+        const pixelData = croppedImgData.data;
+        for (let i = 0; i < pixelData.length; i += 4 * 10) {
+          if (pixelData[i + 3] > 150) {
+             const r = pixelData[i].toString(16).padStart(2, '0');
+             const g = pixelData[i + 1].toString(16).padStart(2, '0');
+             const b = pixelData[i + 2].toString(16).padStart(2, '0');
+             domColor = `#${r}${g}${b}`;
+             break;
+          }
+        }
+
+        if (!isSubscribed) return;
+
+        const newAsset: ProcessedAsset = {
+          id: slice.id,
+          name: currentName,
+          rect: tightRect,
+          pngDataUrl,
+          rasterDataUrl: embedDataUrl,
+          rasterFormat: embedFormat,
+          width: tightRect.width,
+          height: tightRect.height,
+          svgMode,
+          svgCode: currentSvgCode,
+          silhouetteSvg: silhouetteSvg || currentSvgCode,
+          colorSvg: colorSvg || currentSvgCode,
+          embeddedSvg: embeddedSvg || currentSvgCode,
+          dominantColor: domColor,
+          tags: [
+            `${tightRect.width}x${tightRect.height}px`,
+            svgMode === 'silhouette' ? 'Силуэт' : svgMode === 'color' ? 'Вектор (цвет)' : `SVG (${embedFormat.toUpperCase()})`
+          ]
+        };
+
+        setProcessed(newAsset);
+        onAssetUpdated(newAsset);
+      });
+    }, 250);
 
     return () => {
       isSubscribed = false;
+      clearTimeout(timer);
     };
   }, [slice, processedImageData, originalImageData, keyColor, svgMode, assetName, embedFormat, embedQuality, trimMargins, keepBackground, smartEdge, erodeAmount]);
 

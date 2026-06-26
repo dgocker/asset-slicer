@@ -552,25 +552,72 @@ export default function Workspace({
         debouncedMergeDistance,
         debouncedPadding,
       );
-      const newSlices: Slice[] = rects.map((rect, idx) => ({
-        id: `slice-${idx}-${Date.now()}`,
-        rect,
-        label: `Объект ${idx + 1}`,
-      }));
 
       setSlices((prevSlices) => {
         const manualSlices = prevSlices.filter(
           (s) => s.id.startsWith("custom-") || s.id.startsWith("smart-"),
         );
-        return [...newSlices, ...manualSlices];
-      });
+        const existingAutoSlices = prevSlices.filter(
+          (s) => !s.id.startsWith("custom-") && !s.id.startsWith("smart-"),
+        );
 
-      // Select the first detected slice by default if available
-      if (newSlices.length > 0) {
-        setSelectedSliceId(newSlices[0].id);
-      } else {
-        setSelectedSliceId(null);
-      }
+        const usedIds = new Set<string>();
+        const newSlices: Slice[] = rects.map((rect, idx) => {
+          let bestMatch: Slice | null = null;
+          let bestIoU = 0;
+
+          for (const ext of existingAutoSlices) {
+            if (usedIds.has(ext.id)) continue;
+            // Intersection rectangle
+            const x1 = Math.max(rect.x, ext.rect.x);
+            const y1 = Math.max(rect.y, ext.rect.y);
+            const x2 = Math.min(rect.x + rect.width, ext.rect.x + ext.rect.width);
+            const y2 = Math.min(rect.y + rect.height, ext.rect.y + ext.rect.height);
+
+            if (x2 > x1 && y2 > y1) {
+              const intersection = (x2 - x1) * (y2 - y1);
+              const union =
+                rect.width * rect.height +
+                ext.rect.width * ext.rect.height -
+                intersection;
+              const iou = intersection / union;
+              if (iou > bestIoU) {
+                bestIoU = iou;
+                bestMatch = ext;
+              }
+            }
+          }
+
+          if (bestMatch && bestIoU > 0.15) {
+            usedIds.add(bestMatch.id);
+            return {
+              id: bestMatch.id,
+              rect,
+              label: bestMatch.label,
+            };
+          }
+
+          const randomSuffix = Math.random().toString(36).substring(2, 7);
+          const newId = `slice-${idx}-${randomSuffix}`;
+          return {
+            id: newId,
+            rect,
+            label: `Объект ${idx + 1}`,
+          };
+        });
+
+        const allSlices = [...newSlices, ...manualSlices];
+
+        // Retain selection of previously selected slice if it still exists
+        setSelectedSliceId((prevId) => {
+          if (prevId && allSlices.some((s) => s.id === prevId)) {
+            return prevId;
+          }
+          return allSlices.length > 0 ? allSlices[0].id : null;
+        });
+
+        return allSlices;
+      });
     } else {
       // Just keep manual/smart slices if auto detect is disabled
       setSlices((prevSlices) =>
@@ -1433,7 +1480,6 @@ export default function Workspace({
       // and a second to color-decontaminate the remaining soft edges.
       const passes = 2;
       const searchRadius = 5;
-      const radius = 3; // for morphological smoothing
 
       // --- OPTIMIZATION: Find bounding box of all non-transparent pixels ---
       let minX = width,
@@ -1457,10 +1503,10 @@ export default function Workspace({
       }
 
       // Pad the bounding box to ensure our convolution filters have room
-      minX = Math.max(0, minX - searchRadius - radius - 1);
-      maxX = Math.min(width - 1, maxX + searchRadius + radius + 1);
-      minY = Math.max(0, minY - searchRadius - radius - 1);
-      maxY = Math.min(height - 1, maxY + searchRadius + radius + 1);
+      minX = Math.max(0, minX - searchRadius - 1);
+      maxX = Math.min(width - 1, maxX + searchRadius + 1);
+      minY = Math.max(0, minY - searchRadius - 1);
+      maxY = Math.min(height - 1, maxY + searchRadius + 1);
 
       for (let pass = 0; pass < passes; pass++) {
         const toErase: number[] = [];
@@ -1583,59 +1629,7 @@ export default function Workspace({
         if (toErase.length === 0 && toRecolor.length === 0) break;
       }
 
-      // Pass 3: Spatial inward feathering (Morphological Edge Smoothing)
-      // We only compute within the padded bounding box to save CPU cycles
-      const alphaBuffer = new Uint8Array(width * height);
-      for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-          const i = y * width + x;
-          alphaBuffer[i] = newMask[i] === 0 ? 0 : procData[i * 4 + 3];
-        }
-      }
-
-      const tempAlpha = new Uint8Array(width * height);
-
-      // Horizontal pass
-      for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-          let sumAlpha = 0;
-          let count = 0;
-          for (let dx = -radius; dx <= radius; dx++) {
-            const nx = x + dx;
-            if (nx >= 0 && nx < width) {
-              sumAlpha += alphaBuffer[y * width + nx];
-              count++;
-            }
-          }
-          tempAlpha[y * width + x] = Math.round(sumAlpha / count);
-        }
-      }
-
-      // Vertical pass and bake
-      for (let x = minX; x <= maxX; x++) {
-        for (let y = minY; y <= maxY; y++) {
-          let sumAlpha = 0;
-          let count = 0;
-          for (let dy = -radius; dy <= radius; dy++) {
-            const ny = y + dy;
-            if (ny >= 0 && ny < height) {
-              sumAlpha += tempAlpha[ny * width + x];
-              count++;
-            }
-          }
-          const finalAlpha = Math.round(sumAlpha / count);
-
-          const origAlpha = alphaBuffer[y * width + x];
-          if (finalAlpha < origAlpha) {
-            // Bake the smoothed alpha into the original image
-            origDataArray[(y * width + x) * 4 + 3] = finalAlpha;
-            // Force keep in mask so chroma doesn't overwrite our smoothed alpha
-            newMask[y * width + x] = 1;
-          }
-        }
-      }
-
-      setOriginalImageData(newOrigData); // Save the color-decontaminated and smoothed image
+      setOriginalImageData(newOrigData); // Save the color-decontaminated image
       setBrushMask(newMask); // Triggers processPixels automatically
       setIsRefining(false);
     }, 50);
