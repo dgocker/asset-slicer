@@ -265,14 +265,18 @@ export default function App() {
                 ) : (
                   <div className="flex flex-col gap-5">
                     {processedImageData && slices.map(slice => (
-                      <AssetCard
+                      <div 
                         key={slice.id}
-                        slice={slice}
-                        processedImageData={processedImageData}
-                        originalImageData={originalImageData}
-                        keyColor={keyColor}
-                        onAssetUpdated={handleAssetUpdated}
-                      />
+                        style={{ contentVisibility: 'auto', containIntrinsicSize: '0 250px' }}
+                      >
+                        <AssetCard
+                          slice={slice}
+                          processedImageData={processedImageData}
+                          originalImageData={originalImageData}
+                          keyColor={keyColor}
+                          onAssetUpdated={handleAssetUpdated}
+                        />
+                      </div>
                     ))}
                   </div>
                 )}

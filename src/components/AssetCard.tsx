@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { Download, Copy, Check, Sparkles, Image as ImageIcon, Code, Palette, Tag } from 'lucide-react';
 import { Slice, SVGMode, ProcessedAsset, ColorRGB } from '../types';
 import { generateSilhouetteSvg, generateColorLayersSvg, generateEmbeddedSvg, trimTransparentMargins, applySmartEdgeCleanup, cropImageData } from '../utils/imageProcess';
@@ -32,12 +32,33 @@ const AssetCard = React.memo(function AssetCard({ slice, processedImageData, ori
   const [erodeAmount, setErodeAmount] = useState<number>(1);
   const [previewBackground, setPreviewBackground] = useState<'checkerboard' | 'black' | 'white'>('checkerboard');
 
+  interface CroppedState {
+    croppedImgData: ImageData;
+    tightRect: { x: number; y: number; width: number; height: number };
+    version: number;
+  }
+
+  const [croppedState, setCroppedState] = useState<CroppedState | null>(null);
+  const lastCroppedDataRef = useRef<ImageData | null>(null);
+
+  // Deep pixel-by-pixel comparison helper for TypedArray performance optimization
+  const areImageDataEqual = (a: ImageData, b: ImageData): boolean => {
+    if (a.width !== b.width || a.height !== b.height) return false;
+    const dataA = a.data;
+    const dataB = b.data;
+    const len = dataA.length;
+    for (let i = 0; i < len; i++) {
+      if (dataA[i] !== dataB[i]) return false;
+    }
+    return true;
+  };
+
+  // STAGE 1: Extract and Clean Sub-region Pixels (Only runs when source image, slice area, or cleanup parameters change)
   useEffect(() => {
     if (!processedImageData) return;
 
     let isSubscribed = true;
 
-    // Debounce processing by 250ms to prevent main thread freezing during active brushing or slider dragging.
     const timer = setTimeout(() => {
       enqueueHeavyTask(async () => {
         if (!isSubscribed) return;
@@ -53,90 +74,28 @@ const AssetCard = React.memo(function AssetCard({ slice, processedImageData, ori
         // 2. Extract cropped PNG from processed/original ImageData
         const sourceData = (keepBackground && originalImageData) ? originalImageData : processedImageData;
         const croppedImgData = cropImageData(sourceData, tightRect);
-        
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = tightRect.width;
-        tempCanvas.height = tightRect.height;
-        const tempCtx = tempCanvas.getContext('2d');
-        if (!tempCtx) return;
-        
-        tempCtx.putImageData(croppedImgData, 0, 0);
 
-        // Apply Smart Edge Cleanup
+        // Apply Smart Edge Cleanup (in-place modification on the fresh croppedImgData copy)
         if (smartEdge) {
           applySmartEdgeCleanup(croppedImgData, erodeAmount, keyColor);
-          tempCtx.putImageData(croppedImgData, 0, 0);
         }
 
-        const pngDataUrl = tempCanvas.toDataURL('image/png');
-
-        // Generate compressed base64 string
-        const embedDataUrl = embedFormat === 'webp'
-          ? tempCanvas.toDataURL('image/webp', embedQuality / 100)
-          : pngDataUrl;
-
-        // 4. Generate the active SVG vectorization format (lazy calculation to prevent thread blocking)
-        let currentSvgCode = '';
-        let silhouetteSvg = '';
-        let colorSvg = '';
-        let embeddedSvg = '';
-
-        if (svgMode === 'silhouette') {
-          silhouetteSvg = generateSilhouetteSvg(croppedImgData, '#1e293b');
-          currentSvgCode = silhouetteSvg;
-        } else if (svgMode === 'color') {
-          colorSvg = generateColorLayersSvg(croppedImgData, 4);
-          currentSvgCode = colorSvg;
-        } else {
-          embeddedSvg = generateEmbeddedSvg(tightRect.width, tightRect.height, embedDataUrl);
-          currentSvgCode = embeddedSvg;
-        }
-
-        // Set default name if empty or generic
-        const currentName = assetName || slice.label.toLowerCase().replace(/\s+/g, '_');
-        if (!assetName && isSubscribed) {
-          setAssetName(currentName);
-        }
-
-        // Determine dominant color representation
-        let domColor = '#4b5563';
-        // Sample a prominent pixel color for visual flair
-        const pixelData = croppedImgData.data;
-        for (let i = 0; i < pixelData.length; i += 4 * 10) {
-          if (pixelData[i + 3] > 150) {
-             const r = pixelData[i].toString(16).padStart(2, '0');
-             const g = pixelData[i + 1].toString(16).padStart(2, '0');
-             const b = pixelData[i + 2].toString(16).padStart(2, '0');
-             domColor = `#${r}${g}${b}`;
-             break;
-          }
+        // Optimization: Fast comparison with the last cropped data
+        if (lastCroppedDataRef.current && areImageDataEqual(lastCroppedDataRef.current, croppedImgData)) {
+          // Pixel data is identical! Bypass any state updates, downstream SVG rendering, or parent notifications.
+          return;
         }
 
         if (!isSubscribed) return;
 
-        const newAsset: ProcessedAsset = {
-          id: slice.id,
-          name: currentName,
-          rect: tightRect,
-          pngDataUrl,
-          rasterDataUrl: embedDataUrl,
-          rasterFormat: embedFormat,
-          width: tightRect.width,
-          height: tightRect.height,
-          svgMode,
-          svgCode: currentSvgCode,
-          silhouetteSvg: silhouetteSvg || currentSvgCode,
-          colorSvg: colorSvg || currentSvgCode,
-          embeddedSvg: embeddedSvg || currentSvgCode,
-          dominantColor: domColor,
-          tags: [
-            `${tightRect.width}x${tightRect.height}px`,
-            svgMode === 'silhouette' ? 'Силуэт' : svgMode === 'color' ? 'Вектор (цвет)' : `SVG (${embedFormat.toUpperCase()})`
-          ]
-        };
+        // Cache the newly processed pixels
+        lastCroppedDataRef.current = croppedImgData;
 
-        setProcessed(newAsset);
-        onAssetUpdated(newAsset);
+        setCroppedState({
+          croppedImgData,
+          tightRect,
+          version: Date.now()
+        });
       });
     }, 250);
 
@@ -144,7 +103,123 @@ const AssetCard = React.memo(function AssetCard({ slice, processedImageData, ori
       isSubscribed = false;
       clearTimeout(timer);
     };
-  }, [slice, processedImageData, originalImageData, keyColor, svgMode, assetName, embedFormat, embedQuality, trimMargins, keepBackground, smartEdge, erodeAmount]);
+  }, [
+    slice.rect.x,
+    slice.rect.y,
+    slice.rect.width,
+    slice.rect.height,
+    processedImageData,
+    originalImageData,
+    keyColor,
+    trimMargins,
+    keepBackground,
+    smartEdge,
+    erodeAmount
+  ]);
+
+  // STAGE 2: Render & Vectorize SVG/Base64 Outputs (Runs on stage 1 output OR when export configurations change)
+  useEffect(() => {
+    if (!croppedState) return;
+
+    let isSubscribed = true;
+
+    enqueueHeavyTask(async () => {
+      if (!isSubscribed) return;
+
+      const { croppedImgData, tightRect } = croppedState;
+
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = tightRect.width;
+      tempCanvas.height = tightRect.height;
+      const tempCtx = tempCanvas.getContext('2d');
+      if (!tempCtx) return;
+      
+      tempCtx.putImageData(croppedImgData, 0, 0);
+
+      const pngDataUrl = tempCanvas.toDataURL('image/png');
+
+      // Generate compressed base64 string
+      const embedDataUrl = embedFormat === 'webp'
+        ? tempCanvas.toDataURL('image/webp', embedQuality / 100)
+        : pngDataUrl;
+
+      // Generate the active SVG vectorization format (lazy calculation to prevent thread blocking)
+      let currentSvgCode = '';
+      let silhouetteSvg = '';
+      let colorSvg = '';
+      let embeddedSvg = '';
+
+      if (svgMode === 'silhouette') {
+        silhouetteSvg = generateSilhouetteSvg(croppedImgData, '#1e293b');
+        currentSvgCode = silhouetteSvg;
+      } else if (svgMode === 'color') {
+        colorSvg = generateColorLayersSvg(croppedImgData, 4);
+        currentSvgCode = colorSvg;
+      } else {
+        embeddedSvg = generateEmbeddedSvg(tightRect.width, tightRect.height, embedDataUrl);
+        currentSvgCode = embeddedSvg;
+      }
+
+      // Set default name if empty or generic
+      const currentName = assetName || slice.label.toLowerCase().replace(/\s+/g, '_');
+      if (!assetName && isSubscribed) {
+        setAssetName(currentName);
+      }
+
+      // Determine dominant color representation
+      let domColor = '#4b5563';
+      // Sample a prominent pixel color for visual flair
+      const pixelData = croppedImgData.data;
+      for (let i = 0; i < pixelData.length; i += 4 * 10) {
+        if (pixelData[i + 3] > 150) {
+           const r = pixelData[i].toString(16).padStart(2, '0');
+           const g = pixelData[i + 1].toString(16).padStart(2, '0');
+           const b = pixelData[i + 2].toString(16).padStart(2, '0');
+           domColor = `#${r}${g}${b}`;
+           break;
+        }
+      }
+
+      if (!isSubscribed) return;
+
+      const newAsset: ProcessedAsset = {
+        id: slice.id,
+        name: currentName,
+        rect: tightRect,
+        pngDataUrl,
+        rasterDataUrl: embedDataUrl,
+        rasterFormat: embedFormat,
+        width: tightRect.width,
+        height: tightRect.height,
+        svgMode,
+        svgCode: currentSvgCode,
+        silhouetteSvg: silhouetteSvg || currentSvgCode,
+        colorSvg: colorSvg || currentSvgCode,
+        embeddedSvg: embeddedSvg || currentSvgCode,
+        dominantColor: domColor,
+        tags: [
+          `${tightRect.width}x${tightRect.height}px`,
+          svgMode === 'silhouette' ? 'Силуэт' : svgMode === 'color' ? 'Вектор (цвет)' : `SVG (${embedFormat.toUpperCase()})`
+        ]
+      };
+
+      setProcessed(newAsset);
+      onAssetUpdated(newAsset);
+    });
+
+    return () => {
+      isSubscribed = false;
+    };
+  }, [
+    croppedState,
+    svgMode,
+    assetName,
+    embedFormat,
+    embedQuality,
+    slice.id,
+    slice.label,
+    onAssetUpdated
+  ]);
 
   const handleCopyCode = () => {
     if (!processed) return;
