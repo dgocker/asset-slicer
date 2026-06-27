@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { Download, Copy, Check, Sparkles, Image as ImageIcon, Palette, Loader2 } from 'lucide-react';
+import { Download, Copy, Check, Sparkles, Image as ImageIcon, Palette, Loader2, Bot } from 'lucide-react';
 import { Slice, SVGMode, ProcessedAsset, ColorRGB } from '../types';
-import { generateSilhouetteSvg, generateColorLayersSvg, generateEmbeddedSvg, trimTransparentMargins, applySmartEdgeCleanup, cropImageData } from '../utils/imageProcess';
+import { generateSilhouetteSvg, generateColorLayersSvg, generateEmbeddedSvg, trimTransparentMargins, applySmartEdgeCleanup, cropImageData, applyAILocalEdgeRefinement } from '../utils/imageProcess';
 import { enqueueHeavyTask, yieldToMain } from '../utils/taskQueue';
 
 interface AssetCardProps {
@@ -13,10 +13,10 @@ interface AssetCardProps {
 }
 
 export default React.memo(function AssetCard({ slice, processedImageData, originalImageData, keyColor, onAssetUpdated }: AssetCardProps) {
-  const [assetName, setAssetName] = useState(() => (slice.label || 'asset').toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_\-]/g, ''));
+  const [assetName, setAssetName] = useState(() => (slice.label || 'asset').trim());
   
   useEffect(() => {
-    setAssetName((slice.label || 'asset').toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_\-]/g, ''));
+    setAssetName((slice.label || 'asset').trim());
   }, [slice.label]);
 
   const [svgMode, setSvgMode] = useState<SVGMode>('embedded');
@@ -29,6 +29,17 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
   const [previewBackground, setPreviewBackground] = useState<'checkerboard' | 'black' | 'white'>('checkerboard');
 
   const [isProcessing, setIsProcessing] = useState(false);
+  
+  // Local AI State
+  const [aiRefinedImageData, setAiRefinedImageData] = useState<ImageData | null>(null);
+  const [isAIRefining, setIsAIRefining] = useState(false);
+
+  // When original/processed image completely changes, reset AI state.
+  // We compare the source data objects themselves.
+  useEffect(() => {
+    setAiRefinedImageData(null);
+  }, [processedImageData, originalImageData, slice.rect.x, slice.rect.y, slice.rect.width, slice.rect.height]);
+
   const [copied, setCopied] = useState(false);
   const [stats, setStats] = useState({ width: 0, height: 0, sizeKb: 0, domColor: '#9ca3af' });
   
@@ -41,20 +52,93 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
   const lastRectRef = useRef<{x: number, y: number, width: number, height: number} | null>(null);
   const lastSettingsRef = useRef<any>(null);
 
+  // AI refinement handler
+  const handleAIRefine = async () => {
+    if (!originalImageData || !processedImageData) return;
+    setIsAIRefining(true);
+    await yieldToMain();
+    
+    try {
+      const croppedOrig = cropImageData(originalImageData, slice.rect);
+      const croppedProc = cropImageData(processedImageData, slice.rect);
+      
+      const refined = await applyAILocalEdgeRefinement(croppedOrig, croppedProc, keyColor || null, 80);
+      setAiRefinedImageData(refined);
+    } catch (error) {
+      console.error("Error during AI refinement:", error);
+    } finally {
+      setIsAIRefining(false);
+    }
+  };
+
+  // FAST CANVAS UPDATE: instant visual feedback without blocking or waiting
+  useEffect(() => {
+    if (!processedImageData || !canvasRef.current) return;
+    
+    let displayData: ImageData;
+    
+    if (aiRefinedImageData) {
+      const currentSource = aiRefinedImageData;
+      let tightRect = { x: 0, y: 0, width: currentSource.width, height: currentSource.height };
+      if (trimMargins) {
+        tightRect = trimTransparentMargins(currentSource, tightRect);
+      }
+      
+      if (tightRect.width > 0 && tightRect.height > 0) {
+        displayData = cropImageData(currentSource, tightRect);
+        if (smartEdge) {
+          applySmartEdgeCleanup(displayData, erodeAmount, keyColor || null);
+        }
+      } else {
+        return;
+      }
+    } else {
+      const currentSource = (keepBackground && originalImageData) ? originalImageData : processedImageData;
+      let tightRect = slice.rect;
+      if (trimMargins) {
+        tightRect = trimTransparentMargins(currentSource, slice.rect);
+      }
+      
+      if (tightRect.width > 0 && tightRect.height > 0) {
+        displayData = cropImageData(currentSource, tightRect);
+        if (smartEdge) {
+          applySmartEdgeCleanup(displayData, erodeAmount, keyColor || null);
+        }
+      } else {
+        return;
+      }
+    }
+
+    canvasRef.current.width = displayData.width;
+    canvasRef.current.height = displayData.height;
+    const ctx = canvasRef.current.getContext('2d');
+    if (ctx) ctx.putImageData(displayData, 0, 0);
+  }, [slice, processedImageData, originalImageData, keyColor, trimMargins, keepBackground, smartEdge, erodeAmount, aiRefinedImageData]);
+
   const processAsset = useCallback(async () => {
     if (!processedImageData) return;
-    const currentSource = (keepBackground && originalImageData) ? originalImageData : processedImageData;
     
-    const settings = { trimMargins, smartEdge, erodeAmount, embedFormat, embedQuality, svgMode, assetName, keyColor };
+    // Which image data to use?
+    let currentSource: ImageData;
+    let baseRect = slice.rect;
+    
+    if (aiRefinedImageData) {
+      currentSource = aiRefinedImageData;
+      baseRect = { x: 0, y: 0, width: currentSource.width, height: currentSource.height };
+    } else {
+      currentSource = (keepBackground && originalImageData) ? originalImageData : processedImageData;
+    }
+    
+    const settings = { trimMargins, smartEdge, erodeAmount, embedFormat, embedQuality, svgMode, assetName, keyColor, aiRefinedImageData };
     const settingsChanged = JSON.stringify(settings) !== JSON.stringify(lastSettingsRef.current);
     
     // Fast check: if source identity and rect and settings are identical, return immediately.
     let possibleSourceChange = true;
     if (lastSourceDataRef.current === currentSource && 
-        lastRectRef.current?.x === slice.rect.x &&
-        lastRectRef.current?.y === slice.rect.y &&
-        lastRectRef.current?.width === slice.rect.width &&
-        lastRectRef.current?.height === slice.rect.height) {
+        lastRectRef.current?.x === baseRect.x &&
+        lastRectRef.current?.y === baseRect.y &&
+        lastRectRef.current?.width === baseRect.width &&
+        lastRectRef.current?.height === baseRect.height) {
       possibleSourceChange = false;
     }
 
@@ -63,7 +147,7 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
     }
 
     // Crop the current region to do a fast pixel comparison before queueing
-    const currentSlicePixels = cropImageData(currentSource, slice.rect);
+    const currentSlicePixels = cropImageData(currentSource, baseRect);
     
     let pixelsChanged = true;
     if (lastSourcePixelsRef.current && 
@@ -87,23 +171,21 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
       return; // Nothing to do!
     }
 
-    // If we reach here, we actually need to process! Show loader immediately.
     setIsProcessing(true);
-    await yieldToMain();
 
     // Enter heavy task queue to avoid blocking main thread with simultaneous crops/SVG tracing
+    // It will run AFTER the user stops moving the slider, because the queue/debounce will handle it
     const result = await enqueueHeavyTask(async () => {
-      // 1. Margins & crop
-      let tightRect = slice.rect;
+      let tightRect = baseRect;
       if (trimMargins) {
-        tightRect = trimTransparentMargins(currentSource, slice.rect);
+        tightRect = trimTransparentMargins(currentSource, baseRect);
       }
+      
       if (tightRect.width <= 0 || tightRect.height <= 0) return { skipped: true, currentSlicePixels };
 
-      const croppedData = cropImageData(currentSource, tightRect);
-
+      const displayData = cropImageData(currentSource, tightRect);
       if (smartEdge) {
-        applySmartEdgeCleanup(croppedData, erodeAmount, keyColor);
+        applySmartEdgeCleanup(displayData, erodeAmount, keyColor || null);
       }
 
       // 2. Data URLs
@@ -111,18 +193,18 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
       tempCanvas.width = tightRect.width;
       tempCanvas.height = tightRect.height;
       const tempCtx = tempCanvas.getContext('2d');
-      if (tempCtx) tempCtx.putImageData(croppedData, 0, 0);
+      if (tempCtx) tempCtx.putImageData(displayData, 0, 0);
 
       const pngDataUrl = tempCanvas.toDataURL('image/png');
       const rasterDataUrl = embedFormat === 'webp' ? tempCanvas.toDataURL('image/webp', embedQuality / 100) : pngDataUrl;
 
       // 3. Dominant Color
       let domColor = '#4b5563';
-      for (let i = 0; i < croppedData.data.length; i += 40) {
-        if (croppedData.data[i + 3] > 150) {
-          const r = croppedData.data[i].toString(16).padStart(2, '0');
-          const g = croppedData.data[i + 1].toString(16).padStart(2, '0');
-          const b = croppedData.data[i + 2].toString(16).padStart(2, '0');
+      for (let i = 0; i < displayData.data.length; i += 40) {
+        if (displayData.data[i + 3] > 150) {
+          const r = displayData.data[i].toString(16).padStart(2, '0');
+          const g = displayData.data[i + 1].toString(16).padStart(2, '0');
+          const b = displayData.data[i + 2].toString(16).padStart(2, '0');
           domColor = `#${r}${g}${b}`;
           break;
         }
@@ -131,11 +213,11 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
       // 4. SVG Code
       let svgCode = '';
       if (svgMode === 'silhouette') {
-        svgCode = generateSilhouetteSvg(croppedData, '#1e293b');
+        svgCode = generateSilhouetteSvg(displayData, '#1e293b');
       } else if (svgMode === 'embedded') {
         svgCode = generateEmbeddedSvg(tightRect.width, tightRect.height, rasterDataUrl);
       } else {
-        svgCode = generateColorLayersSvg(croppedData, 4);
+        svgCode = generateColorLayersSvg(displayData, 4);
       }
 
       return {
@@ -153,7 +235,7 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
           dominantColor: domColor,
           tags: [`${tightRect.width}x${tightRect.height}px`]
         } as ProcessedAsset,
-        displayData: croppedData,
+        displayData,
         rawSlicePixels: currentSlicePixels
       };
     });
@@ -181,14 +263,6 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
         domColor: (result as any).asset.dominantColor || '#9ca3af'
       });
 
-      // Update the preview canvas directly
-      if (canvasRef.current) {
-        canvasRef.current.width = (result as any).displayData.width;
-        canvasRef.current.height = (result as any).displayData.height;
-        const ctx = canvasRef.current.getContext('2d');
-        if (ctx) ctx.putImageData((result as any).displayData, 0, 0);
-      }
-
       onAssetUpdated((result as any).asset);
     }
     
@@ -196,9 +270,10 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
   }, [slice, processedImageData, originalImageData, keyColor, trimMargins, keepBackground, smartEdge, erodeAmount, embedFormat, embedQuality, svgMode, assetName, onAssetUpdated]);
 
   useEffect(() => {
+    // Debounce the entire process slightly more so it doesn't queue 100 tasks while dragging
     const timer = setTimeout(() => {
       processAsset();
-    }, 150);
+    }, 250);
     return () => clearTimeout(timer);
   }, [processAsset]);
 
@@ -262,14 +337,8 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
           <div className="relative w-full h-full flex items-center justify-center">
             <canvas
               ref={canvasRef}
-              className={`max-w-full max-h-full object-contain transition-all duration-300 ${isProcessing ? 'opacity-50 scale-95' : 'opacity-100 scale-100'}`}
+              className="max-w-full max-h-full object-contain"
             />
-            {isProcessing && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-white/40 backdrop-blur-[1px] rounded-xl pointer-events-none">
-                <Loader2 className="w-5.5 h-5.5 animate-spin text-neutral-600" />
-                <span className="text-[9px] font-bold text-neutral-600 shadow-white drop-shadow-md">Обработка...</span>
-              </div>
-            )}
           </div>
         </div>
 
@@ -294,7 +363,7 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
             <input
               type="text"
               value={assetName}
-              onChange={e => setAssetName(e.target.value.toLowerCase().replace(/[^a-z0-9_\-]/g, ''))}
+              onChange={e => setAssetName(e.target.value)}
               placeholder="название_ассета"
               className="w-full text-sm font-semibold text-neutral-800 bg-neutral-50 hover:bg-neutral-100/50 focus:bg-white border border-neutral-100 focus:border-neutral-300 rounded-xl px-3.5 py-2 transition-all outline-none"
             />
@@ -343,6 +412,49 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
                   ))}
                 </div>
               )}
+            </div>
+
+            {/* Local AI Refinement */}
+            <div className="flex flex-col gap-2 p-2.5 bg-gradient-to-r from-violet-500/10 to-fuchsia-500/10 border border-violet-100 rounded-xl">
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-0.5 pr-2">
+                    <span className="text-xs font-bold text-violet-800 flex items-center gap-1.5">
+                      <Bot className="w-3.5 h-3.5 text-violet-600 shrink-0" />
+                      AI Очистка ассета
+                    </span>
+                    <p className="text-[10px] text-violet-600/70 leading-normal">Точечный анализ контуров для этого элемента.</p>
+                  </div>
+                </div>
+                
+                {aiRefinedImageData ? (
+                  <div className="flex items-center justify-between text-[10px] font-bold text-violet-700 bg-violet-100 p-2 rounded-lg">
+                    <div className="flex items-center gap-1.5">
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Обработан</span>
+                    </div>
+                    <button onClick={() => setAiRefinedImageData(null)} className="text-red-500 hover:text-red-700 px-2 py-0.5 transition-all">Сбросить</button>
+                  </div>
+                ) : (
+                  <button 
+                    onClick={handleAIRefine}
+                    disabled={isAIRefining}
+                    className="w-full bg-violet-600 hover:bg-violet-500 disabled:bg-violet-400 text-white font-bold py-2 px-3 rounded-lg shadow-sm transition-all text-[11px] flex items-center justify-center gap-2 active:scale-95"
+                  >
+                    {isAIRefining ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Обработка...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-3 h-3" />
+                        <span>Запустить очистку</span>
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 

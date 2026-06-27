@@ -888,3 +888,244 @@ export function applySmartEdgeCleanup(
   return imageData;
 }
 
+
+export async function applyAILocalEdgeRefinement(
+  originalData: ImageData,
+  processedData: ImageData,
+  transparentColor: { r: number; g: number; b: number } | null,
+  tolerance: number
+): Promise<ImageData> {
+  const width = originalData.width;
+  const height = originalData.height;
+
+  const resultData = new ImageData(
+    new Uint8ClampedArray(processedData.data),
+    width,
+    height,
+  );
+  const procData = resultData.data;
+  const rawOrigData = originalData.data;
+
+  // 3 passes: 2 for structural erosion of fringes, 1 for color decontamination
+  const passes = 3;
+  const searchRadius = 6; 
+
+  let minX = width, minY = height, maxX = 0, maxY = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (procData[(y * width + x) * 4 + 3] > 0) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (minX > maxX) {
+    return resultData; // nothing to process
+  }
+
+  minX = Math.max(0, minX - searchRadius - 2);
+  maxX = Math.min(width - 1, maxX + searchRadius + 2);
+  minY = Math.max(0, minY - searchRadius - 2);
+  maxY = Math.min(height - 1, maxY + searchRadius + 2);
+
+  const isOrigBg = new Uint8Array(width * height);
+  if (transparentColor) {
+    const rKey = transparentColor.r;
+    const gKey = transparentColor.g;
+    const bKey = transparentColor.b;
+    const tolSqr = (tolerance + 30) * (tolerance + 30); 
+    for (let i = 0; i < width * height; i++) {
+      const a = rawOrigData[i * 4 + 3];
+      if (a === 0) {
+        isOrigBg[i] = 1;
+      } else {
+        const r = rawOrigData[i * 4];
+        const g = rawOrigData[i * 4 + 1];
+        const b = rawOrigData[i * 4 + 2];
+        const distSqr = (r - rKey) ** 2 + (g - gKey) ** 2 + (b - bKey) ** 2;
+        if (distSqr <= tolSqr) {
+          isOrigBg[i] = 1;
+        }
+      }
+    }
+  } else {
+    for (let i = 0; i < width * height; i++) {
+      if (rawOrigData[i * 4 + 3] < 128) {
+        isOrigBg[i] = 1;
+      }
+    }
+  }
+
+  for (let pass = 0; pass < passes; pass++) {
+    const toErase: number[] = [];
+    const toRecolor: { idx: number; r: number; g: number; b: number; a?: number }[] = [];
+
+    for (let y = minY; y <= maxY; y++) {
+      if (y % 50 === 0) {
+        await new Promise(r => setTimeout(r, 0));
+      }
+      for (let x = minX; x <= maxX; x++) {
+        const idx = y * width + x;
+        const currentAlpha = procData[idx * 4 + 3];
+
+        if (currentAlpha === 0) continue;
+
+        let isEdge = false;
+        let transparentNeighbors = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+              if (procData[(ny * width + nx) * 4 + 3] < 128) {
+                isEdge = true;
+                transparentNeighbors++;
+              }
+            } else {
+              isEdge = true;
+              transparentNeighbors++;
+            }
+          }
+        }
+
+        if (isEdge || currentAlpha < 255) {
+          let nearOrigBg = false;
+          const checkRadius = 6; 
+          for (let dy = -checkRadius; dy <= checkRadius && !nearOrigBg; dy++) {
+            for (let dx = -checkRadius; dx <= checkRadius; dx++) {
+              const nx = x + dx;
+              const ny = y + dy;
+              if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                if (isOrigBg[ny * width + nx] === 1) {
+                  nearOrigBg = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          const origR = rawOrigData[idx * 4];
+          const origG = rawOrigData[idx * 4 + 1];
+          const origB = rawOrigData[idx * 4 + 2];
+          
+          let isSolidForeground = false;
+          if (transparentColor) {
+            const limitVal = Math.max(160, tolerance + 80);
+            const limitSqr = limitVal * limitVal;
+            const distSqr = (origR - transparentColor.r) ** 2 + (origG - transparentColor.g) ** 2 + (origB - transparentColor.b) ** 2;
+            isSolidForeground = distSqr > limitSqr;
+          }
+
+          if (!nearOrigBg || (isSolidForeground && pass < passes - 1)) {
+            if (pass < passes - 1) continue;
+          }
+
+          let fgR = 0, fgG = 0, fgB = 0, fgWeight = 0;
+          let bgR = 0, bgG = 0, bgB = 0, bgWeight = 0;
+
+          for (let dy = -searchRadius; dy <= searchRadius; dy++) {
+            for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+              const nx = x + dx;
+              const ny = y + dy;
+              if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                const nIdx = ny * width + nx;
+                const alpha = procData[nIdx * 4 + 3];
+                const r = rawOrigData[nIdx * 4];
+                const g = rawOrigData[nIdx * 4 + 1];
+                const b = rawOrigData[nIdx * 4 + 2];
+                
+                const distWeight = 1 / (1 + Math.sqrt(dx*dx + dy*dy));
+
+                if (alpha < 128) {
+                  let distToBgKeySqr = 0;
+                  if (transparentColor) {
+                    distToBgKeySqr = (r - transparentColor.r) ** 2 + (g - transparentColor.g) ** 2 + (b - transparentColor.b) ** 2;
+                  }
+                  
+                  if (!transparentColor || distToBgKeySqr < 14400) { 
+                    bgR += r * distWeight; bgG += g * distWeight; bgB += b * distWeight; bgWeight += distWeight;
+                  }
+                } else if (alpha > 200) {
+                  fgR += r * distWeight; fgG += g * distWeight; fgB += b * distWeight; fgWeight += distWeight;
+                }
+              }
+            }
+          }
+
+          if (bgWeight > 0 && fgWeight > 0) {
+            const bgMeanR = bgR / bgWeight;
+            const bgMeanG = bgG / bgWeight;
+            const bgMeanB = bgB / bgWeight;
+
+            const fgMeanR = fgR / fgWeight;
+            const fgMeanG = fgG / fgWeight;
+            const fgMeanB = fgB / fgWeight;
+
+            const r = rawOrigData[idx * 4];
+            const g = rawOrigData[idx * 4 + 1];
+            const b = rawOrigData[idx * 4 + 2];
+
+            const distBgSqr = (r - bgMeanR) ** 2 + (g - bgMeanG) ** 2 + (b - bgMeanB) ** 2;
+            const distFgSqr = (r - fgMeanR) ** 2 + (g - fgMeanG) ** 2 + (b - fgMeanB) ** 2;
+
+            if (pass < passes - 1) {
+              // Pass 0, 1: Structure Erosion (Conservative)
+              if (distBgSqr < distFgSqr * 0.3) {
+                toErase.push(idx);
+              } else if (transparentNeighbors >= 5 && distBgSqr < distFgSqr * 0.8) {
+                toErase.push(idx);
+              }
+            } else {
+              // Final Pass: Color Decontamination & Alpha Blending (Soft Edges)
+              const distBg = Math.sqrt(distBgSqr);
+              const distFg = Math.sqrt(distFgSqr);
+
+              if (distBg < distFg * 2.0 || transparentNeighbors > 0) {
+                let ratio = distBg / (distBg + distFg + 0.001);
+                ratio = Math.max(0, Math.min(1, (ratio - 0.2) * 1.5)); // Contrast enhancement
+
+                let newAlpha = Math.round(ratio * currentAlpha);
+                if (isSolidForeground && newAlpha < currentAlpha) {
+                  newAlpha = currentAlpha;
+                }
+
+                if (newAlpha > 0) {
+                  toRecolor.push({ idx, r: fgMeanR, g: fgMeanG, b: fgMeanB, a: newAlpha });
+                } else {
+                  toErase.push(idx);
+                }
+              }
+            }
+          } else if (pass < passes - 1 && fgWeight === 0 && bgWeight > 0) {
+             // Island of noise
+             toErase.push(idx);
+          }
+        }
+      }
+    }
+
+    for (const idx of toErase) {
+      procData[idx * 4 + 3] = 0; 
+    }
+
+    for (const rc of toRecolor) {
+      procData[rc.idx * 4] = rc.r;
+      procData[rc.idx * 4 + 1] = rc.g;
+      procData[rc.idx * 4 + 2] = rc.b;
+      if (rc.a !== undefined) {
+        procData[rc.idx * 4 + 3] = rc.a;
+      }
+    }
+
+    // Optimization: if no structure changes in pass 0, skip pass 1
+    if (toErase.length === 0 && pass < passes - 1) {
+       pass = passes - 2; 
+    }
+  }
+  
+  return resultData;
+}

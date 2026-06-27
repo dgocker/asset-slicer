@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
+import React, { useState, useCallback, useRef } from 'react';
+import { motion } from 'motion/react';
 import { 
   Layers, 
   Scissors, 
@@ -25,8 +25,9 @@ import AssetCard from './components/AssetCard';
 export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [slices, setSlices] = useState<Slice[]>([]);
-  const [processedImageData, setProcessedImageData] = useState<ImageData | null>(null);
-  const [originalImageData, setOriginalImageData] = useState<ImageData | null>(null);
+  const processedImageDataRef = useRef<ImageData | null>(null);
+  const originalImageDataRef = useRef<ImageData | null>(null);
+  const [dataVersion, setDataVersion] = useState(0);
   const [keyColor, setKeyColor] = useState<ColorRGB | null>(null);
   const [assets, setAssets] = useState<{ [id: string]: ProcessedAsset }>({});
   const [isZipping, setIsZipping] = useState(false);
@@ -38,15 +39,16 @@ export default function App() {
 
   const handleSlicesUpdated = useCallback((newSlices: Slice[], imgData: ImageData, origData?: ImageData, kColor?: ColorRGB) => {
     setSlices(newSlices);
-    setProcessedImageData(imgData);
+    processedImageDataRef.current = imgData;
     if (origData) {
-      setOriginalImageData(origData);
+      originalImageDataRef.current = origData;
     }
     if (kColor) {
       setKeyColor(kColor);
     } else {
       setKeyColor(null);
     }
+    setDataVersion(v => v + 1);
   }, []);
 
   const handleAssetUpdated = useCallback((asset: ProcessedAsset) => {
@@ -59,10 +61,11 @@ export default function App() {
   const handleReset = useCallback(() => {
     setImageSrc(null);
     setSlices([]);
-    setProcessedImageData(null);
-    setOriginalImageData(null);
+    processedImageDataRef.current = null;
+    originalImageDataRef.current = null;
     setKeyColor(null);
     setAssets({});
+    setDataVersion(0);
   }, []);
 
   // Triggers zipping and downloading all active assets in a single structured file
@@ -141,16 +144,11 @@ export default function App() {
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-6 flex flex-col gap-6">
         
-        <AnimatePresence mode="wait">
           {!imageSrc ? (
             /* Upload State */
-            <motion.div
+            <div
               key="uploader-view"
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -15 }}
-              transition={{ duration: 0.35, ease: 'easeOut' }}
-              className="flex-1 flex flex-col items-center justify-center py-8 lg:py-16"
+              className="flex-1 flex flex-col items-center justify-center py-8 lg:py-16 animate-in fade-in slide-in-from-bottom-4 duration-500"
             >
               {/* Introduction Text Block */}
               <div className="text-center max-w-xl mb-8">
@@ -194,16 +192,12 @@ export default function App() {
                 </div>
               </div>
 
-            </motion.div>
+            </div>
           ) : (
             /* Active Workspace State */
-            <motion.div
+            <div
               key="workspace-view"
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -15 }}
-              transition={{ duration: 0.35, ease: 'easeOut' }}
-              className="flex flex-col gap-6"
+              className="flex flex-col gap-6 animate-in fade-in slide-in-from-bottom-4 duration-500"
             >
               
               {/* Workspace Board */}
@@ -264,12 +258,12 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="flex flex-col gap-5">
-                    {processedImageData && slices.map(slice => (
+                    {processedImageDataRef.current && slices.map(slice => (
                       <AssetCard
                         key={slice.id}
                         slice={slice}
-                        processedImageData={processedImageData}
-                        originalImageData={originalImageData}
+                        processedImageData={processedImageDataRef.current!}
+                        originalImageData={originalImageDataRef.current}
                         keyColor={keyColor}
                         onAssetUpdated={handleAssetUpdated}
                       />
@@ -278,9 +272,8 @@ export default function App() {
                 )}
               </div>
 
-            </motion.div>
+            </div>
           )}
-        </AnimatePresence>
 
       </main>
 

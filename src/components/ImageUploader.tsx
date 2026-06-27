@@ -20,6 +20,7 @@ export default function ImageUploader({ onImageSelected }: ImageUploaderProps) {
     if (file) {
       loadImageFile(file);
     }
+    e.target.value = '';
   };
 
   const loadImageFile = (file: File) => {

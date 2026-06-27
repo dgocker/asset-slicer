@@ -108,16 +108,14 @@ export default function Workspace({
   const [selectedSliceId, setSelectedSliceId] = useState<string | null>(null);
 
   // Pixel data buffers
-  const [originalImageData, setOriginalImageData] = useState<ImageData | null>(
-    null,
-  );
-  const [brushMask, setBrushMask] = useState<Uint8Array | null>(null); // 0 = erased, 1 = restored, 255 = default (chroma key)
-  const [processedImageData, setProcessedImageData] =
-    useState<ImageData | null>(null);
+  const originalImageDataRef = useRef<ImageData | null>(null);
+  const brushMaskRef = useRef<Uint8Array | null>(null); // 0 = erased, 1 = restored, 255 = default (chroma key)
+  const processedImageDataRef = useRef<ImageData | null>(null);
+  const [dataVersion, setDataVersion] = useState(0);
 
   // Drawing state
   const [isDrawing, setIsDrawing] = useState(false);
-  const [isRefining, setIsRefining] = useState(false);
+
   const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(
     null,
   );
@@ -229,7 +227,7 @@ export default function Workspace({
   const magnifierContainerRef = useRef<HTMLDivElement>(null);
   const [magnifierZoom, setMagnifierZoom] = useState<number>(6);
   const [isMagnifierActive, setIsMagnifierActive] = useState<boolean>(false);
-  const [history, setHistory] = useState<
+  const historyRef = useRef<
     Array<{
       slices: Slice[];
       manualSeeds: Array<{ x: number; y: number }>;
@@ -237,7 +235,9 @@ export default function Workspace({
       brushMask: Uint8Array | null;
     }>
   >([]);
-  const [magnifierBackup, setMagnifierBackup] = useState<{
+  const [historyCount, setHistoryCount] = useState(0);
+
+  const magnifierBackupRef = useRef<{
     slices: Slice[];
     manualSeeds: Array<{ x: number; y: number }>;
     transparentColor: ColorRGB | null;
@@ -251,53 +251,46 @@ export default function Workspace({
     slices,
     manualSeeds,
     transparentColor,
-    brushMask,
+    brushMask: brushMaskRef.current,
   });
   useEffect(() => {
     latestStateRef.current = {
       slices,
       manualSeeds,
       transparentColor,
-      brushMask,
+      brushMask: brushMaskRef.current,
     };
-  }, [slices, manualSeeds, transparentColor, brushMask]);
+  }, [slices, manualSeeds, transparentColor, brushMaskRef.current]);
 
   const pushToHistory = () => {
-    const maskCopy = brushMask ? new Uint8Array(brushMask) : null;
-    setHistory((prev) => {
-      const next = [
-        ...prev,
-        {
-          slices: [...slices],
-          manualSeeds: [...manualSeeds],
-          transparentColor: transparentColor ? { ...transparentColor } : null,
-          brushMask: maskCopy,
-        },
-      ];
-      if (next.length > 25) {
-        next.shift();
-      }
-      return next;
+    const maskCopy = brushMaskRef.current ? new Uint8Array(brushMaskRef.current) : null;
+    historyRef.current.push({
+      slices: [...slices],
+      manualSeeds: [...manualSeeds],
+      transparentColor: transparentColor ? { ...transparentColor } : null,
+      brushMask: maskCopy,
     });
+    if (historyCount > 25) {
+      historyRef.current.shift();
+    }
+    setHistoryCount(historyCount);
   };
 
   const handleUndo = () => {
-    setHistory((prev) => {
-      if (prev.length === 0) return prev;
-      const next = [...prev];
-      const prevState = next.pop();
-      if (prevState) {
-        setSlices(prevState.slices);
-        setManualSeeds(prevState.manualSeeds);
-        setTransparentColor(prevState.transparentColor);
-        if (prevState.brushMask) {
-          setBrushMask(new Uint8Array(prevState.brushMask));
-        } else {
-          setBrushMask(null);
-        }
+    if (historyCount === 0) return;
+    const prevState = historyRef.current.pop();
+    setHistoryCount(historyCount);
+    if (prevState) {
+      setSlices(prevState.slices);
+      setManualSeeds(prevState.manualSeeds);
+      setTransparentColor(prevState.transparentColor);
+      if (prevState.brushMask) {
+        brushMaskRef.current = new Uint8Array(prevState.brushMask);
+      } else {
+        brushMaskRef.current = null;
       }
-      return next;
-    });
+      setDataVersion(v => v + 1);
+    }
   };
 
   const drawMagnifierRafRef = useRef<number | null>(null);
@@ -384,12 +377,12 @@ export default function Workspace({
         brushMask: latestMask,
       } = latestStateRef.current;
       const maskCopy = latestMask ? new Uint8Array(latestMask) : null;
-      setMagnifierBackup({
+      magnifierBackupRef.current = {
         slices: [...latestSlices],
         manualSeeds: [...latestSeeds],
         transparentColor: latestColor ? { ...latestColor } : null,
         brushMask: maskCopy,
-      });
+      };
 
       if (!magnifierCoordsRef.current && canvasRef.current) {
         const x = Math.round(canvasRef.current.width / 2);
@@ -425,7 +418,7 @@ export default function Workspace({
         }, 16);
       }
     } else {
-      setMagnifierBackup(null);
+      magnifierBackupRef.current = null;
       magnifierCoordsRef.current = null;
     }
   }, [isMagnifierActive]);
@@ -434,7 +427,6 @@ export default function Workspace({
   useEffect(() => {
     const img = new Image();
     img.crossOrigin = "anonymous";
-    img.src = imageSrc;
     img.onload = () => {
       setImage(img);
 
@@ -451,7 +443,8 @@ export default function Workspace({
           img.naturalWidth,
           img.naturalHeight,
         );
-        setOriginalImageData(imgData);
+        originalImageDataRef.current = imgData;
+        setDataVersion(v => v + 1);
 
         // Auto-detect dominant background color
         const detectedBg = detectBackgroundColor(imgData);
@@ -462,9 +455,11 @@ export default function Workspace({
         // Initialize brush mask
         const mask = new Uint8Array(img.naturalWidth * img.naturalHeight);
         mask.fill(255); // Fill with default
-        setBrushMask(mask);
+        brushMaskRef.current = mask;
+        setDataVersion(v => v + 1);
       }
     };
+    img.src = imageSrc;
   }, [imageSrc]);
 
   // Ref to track last parameters that triggered auto-detection
@@ -494,17 +489,17 @@ export default function Workspace({
 
   // Handle updates to transparency and slicing configurations
   useEffect(() => {
-    if (!originalImageData || !brushMask || !image) return;
+    if (!originalImageDataRef.current || !brushMaskRef.current || !image) return;
 
     // Skip heavy calculations while actively drawing/brushing to prevent lag
-    if (isDrawing || isRefining) {
+    if (isDrawing) {
       return;
     }
 
     // Check if parameters actually changed to avoid re-detecting deleted auto-slices
     const prev = lastDetectParamsRef.current;
     if (
-      prev.brushMask === brushMask &&
+      prev.brushMask === brushMaskRef.current &&
       prev.transparentColor?.r === transparentColor?.r &&
       prev.transparentColor?.g === transparentColor?.g &&
       prev.transparentColor?.b === transparentColor?.b &&
@@ -522,7 +517,7 @@ export default function Workspace({
     }
 
     lastDetectParamsRef.current = {
-      brushMask,
+      brushMask: brushMaskRef.current,
       transparentColor,
       tolerance: debouncedTolerance,
       edgeSoftness: debouncedEdgeSoftness,
@@ -536,15 +531,16 @@ export default function Workspace({
 
     // 1. Process image pixels with Chroma Key + Brush Mask
     const processedData = processPixels(
-      originalImageData,
-      brushMask,
+      originalImageDataRef.current,
+      brushMaskRef.current,
       transparentColor,
       debouncedTolerance,
       debouncedEdgeSoftness,
       contiguousMode,
       lastPickedCoords,
     );
-    setProcessedImageData(processedData);
+    processedImageDataRef.current = processedData;
+    setDataVersion(v => v + 1);
 
     // 2. Detect slices automatically (only if enabled)
     if (autoDetectEnabled) {
@@ -641,8 +637,8 @@ export default function Workspace({
       });
     }
   }, [
-    originalImageData,
-    brushMask,
+    originalImageDataRef.current,
+    brushMaskRef.current,
     transparentColor,
     debouncedTolerance,
     debouncedEdgeSoftness,
@@ -654,34 +650,33 @@ export default function Workspace({
     debouncedPadding,
     image,
     isDrawing,
-    isRefining,
     autoDetectEnabled,
   ]);
 
   // Redraw canvas locally on any visual changes (including active drawing/dragging)
   useEffect(() => {
-    if (!processedImageData) return;
-    drawWorkspace(processedImageData, slices);
+    if (!processedImageDataRef.current) return;
+    drawWorkspace(processedImageDataRef.current, slices);
   }, [
     slices,
     selectedSliceId,
     workspaceMode,
     drawRect,
-    processedImageData,
+    dataVersion, // Use dataVersion to trigger effect when ref changes
     manualSeeds,
     contiguousMode,
   ]);
 
   // Notify parent ONLY when slices, processed image data, or keyColor changes
   useEffect(() => {
-    if (!processedImageData) return;
+    if (!processedImageDataRef.current) return;
     onSlicesUpdated(
       slices,
-      processedImageData,
-      originalImageData || undefined,
+      processedImageDataRef.current,
+      originalImageDataRef.current || undefined,
       transparentColor || undefined,
     );
-  }, [slices, processedImageData, originalImageData, transparentColor]);
+  }, [slices, dataVersion, transparentColor]);
 
   // Redraw magnifier when zoom level, processed image data, or activation state changes
   useEffect(() => {
@@ -693,7 +688,7 @@ export default function Workspace({
         magnifierCoordsRef.current.y,
       );
     }
-  }, [magnifierZoom, processedImageData, isMagnifierActive]);
+  }, [magnifierZoom, processedImageDataRef.current, isMagnifierActive]);
 
   // CSS touch-action handles preventing default scrolling, so we don't need manual passive: false listeners.
   // This completely eliminates native scroll jank and main thread blocking.
@@ -1141,10 +1136,10 @@ export default function Workspace({
 
     if (!coords || !canvasRef.current) return;
 
-    // Save history before any modifications
+    // Save historyRef.current before any modifications
     pushToHistory();
 
-    if (workspaceMode === "brush" && brushMode !== "none" && brushMask) {
+    if (workspaceMode === "brush" && brushMode !== "none" && brushMaskRef.current) {
       // Begin manual erase/restore brushing immediately (continuous)
       applyBrush(coords.x, coords.y);
     } else if (workspaceMode === "slice") {
@@ -1285,7 +1280,7 @@ export default function Workspace({
 
     if (!coords || !canvasRef.current) return;
 
-    if (workspaceMode === "brush" && brushMode !== "none" && brushMask) {
+    if (workspaceMode === "brush" && brushMode !== "none" && brushMaskRef.current) {
       applyBrush(coords.x, coords.y);
     } else if (workspaceMode === "slice" && drawStart) {
       const x = Math.min(drawStart.x, coords.x);
@@ -1332,17 +1327,17 @@ export default function Workspace({
 
     if (!finalCoords) return;
 
-    // Normal interactions - push history before making changes
+    // Normal interactions - push historyRef.current before making changes
     pushToHistory();
 
     if (workspaceMode === "chroma") {
       // Commit Chroma Key selection and manual seed addition on release (making it incredibly precise)
-      if (originalImageData) {
+      if (originalImageDataRef.current) {
         const idx =
-          (finalCoords.y * originalImageData.width + finalCoords.x) * 4;
-        const r = originalImageData.data[idx];
-        const g = originalImageData.data[idx + 1];
-        const b = originalImageData.data[idx + 2];
+          (finalCoords.y * originalImageDataRef.current.width + finalCoords.x) * 4;
+        const r = originalImageDataRef.current.data[idx];
+        const g = originalImageDataRef.current.data[idx + 1];
+        const b = originalImageDataRef.current.data[idx + 2];
         setTransparentColor({ r, g, b });
         setLastPickedCoords({ x: finalCoords.x, y: finalCoords.y });
 
@@ -1363,9 +1358,9 @@ export default function Workspace({
       }
     } else if (workspaceMode === "smart") {
       // Detect connected component precisely on release
-      if (processedImageData) {
+      if (processedImageDataRef.current) {
         const rect = findConnectedComponentAt(
-          processedImageData,
+          processedImageDataRef.current,
           finalCoords.x,
           finalCoords.y,
           80,
@@ -1388,8 +1383,8 @@ export default function Workspace({
     } else if (workspaceMode === "slice") {
       if (drawRect && drawRect.width > 5 && drawRect.height > 5) {
         let finalRect = drawRect;
-        if (snapToEdges && processedImageData) {
-          finalRect = trimTransparentMargins(processedImageData, drawRect);
+        if (snapToEdges && processedImageDataRef.current) {
+          finalRect = trimTransparentMargins(processedImageDataRef.current, drawRect);
         }
         // Add custom slice
         setSlices((prev) => {
@@ -1427,11 +1422,11 @@ export default function Workspace({
    * Applies the brush mask onto coordinates inside the original resolution space.
    */
   const applyBrush = (cx: number, cy: number) => {
-    if (!brushMask || !originalImageData || !processedImageData) return;
-    const { width, height } = originalImageData;
-    const updatedMask = new Uint8Array(brushMask);
+    if (!brushMaskRef.current || !originalImageDataRef.current || !processedImageDataRef.current) return;
+    const { width, height } = originalImageDataRef.current;
+    const updatedMask = new Uint8Array(brushMaskRef.current);
     const updatedProcessed = new ImageData(
-      new Uint8ClampedArray(processedImageData.data),
+      new Uint8ClampedArray(processedImageDataRef.current.data),
       width,
       height,
     );
@@ -1456,274 +1451,14 @@ export default function Workspace({
             updatedProcessed.data[idx * 4 + 3] = 0; // Erase
           } else {
             updatedProcessed.data[idx * 4 + 3] =
-              originalImageData.data[idx * 4 + 3]; // Restore original alpha
+              originalImageDataRef.current.data[idx * 4 + 3]; // Restore original alpha
           }
         }
       }
     }
-    setBrushMask(updatedMask);
-    setProcessedImageData(updatedProcessed);
-  };
-
-  /**
-   * Experimental "Local AI" feature to detect and erase fringing/halos around edges.
-   */
-  const applyAIEdgeRefinement = async () => {
-    if (!originalImageData || !processedImageData || !brushMask) return;
-    setIsRefining(true);
-
-    // Yield to the event loop so the "loading" state can render
-    await yieldToMain();
-
-    try {
-      pushToHistory(); // Save state before modifying
-
-        const width = originalImageData.width;
-        const height = originalImageData.height;
-
-        // Clone original image data so we can destructively apply color bleeding while allowing undo
-        const newOrigData = new ImageData(
-          new Uint8ClampedArray(originalImageData.data),
-          width,
-          height,
-        );
-        const origDataArray = newOrigData.data;
-        const procData = new Uint8ClampedArray(processedImageData.data);
-
-        const newMask = new Uint8Array(brushMask);
-
-        // We only need 2 passes: one to trim the absolute worst fringing,
-        // and a second to color-decontaminate the remaining soft edges.
-        const passes = 2;
-        const searchRadius = 5;
-
-        // --- OPTIMIZATION: Find bounding box of all non-transparent pixels ---
-        let minX = width,
-          minY = height,
-          maxX = 0,
-          maxY = 0;
-        for (let y = 0; y < height; y++) {
-          for (let x = 0; x < width; x++) {
-            if (procData[(y * width + x) * 4 + 3] > 0) {
-              if (x < minX) minX = x;
-              if (x > maxX) maxX = x;
-              if (y < minY) minY = y;
-              if (y > maxY) maxY = y;
-            }
-          }
-        }
-
-        if (minX > maxX) {
-          return; // nothing to process
-        }
-
-        // Pad the bounding box to ensure our convolution filters have room
-        minX = Math.max(0, minX - searchRadius - 1);
-        maxX = Math.min(width - 1, maxX + searchRadius + 1);
-        minY = Math.max(0, minY - searchRadius - 1);
-        maxY = Math.min(height - 1, maxY + searchRadius + 1);
-
-        // Precalculate background mask for original image once to avoid Math.sqrt or getColorDistance inside loops
-        const isOrigBg = new Uint8Array(width * height);
-        const origData = originalImageData.data;
-        if (transparentColor) {
-          const rKey = transparentColor.r;
-          const gKey = transparentColor.g;
-          const bKey = transparentColor.b;
-          const tolSqr = tolerance * tolerance;
-          for (let i = 0; i < width * height; i++) {
-            const a = origData[i * 4 + 3];
-            if (a === 0) {
-              isOrigBg[i] = 1;
-            } else {
-              const r = origData[i * 4];
-              const g = origData[i * 4 + 1];
-              const b = origData[i * 4 + 2];
-              const distSqr = (r - rKey) ** 2 + (g - gKey) ** 2 + (b - bKey) ** 2;
-              if (distSqr <= tolSqr) {
-                isOrigBg[i] = 1;
-              }
-            }
-          }
-        } else {
-          for (let i = 0; i < width * height; i++) {
-            if (origData[i * 4 + 3] === 0) {
-              isOrigBg[i] = 1;
-            }
-          }
-        }
-
-        for (let pass = 0; pass < passes; pass++) {
-          const toErase: number[] = [];
-          const toRecolor: { idx: number; r: number; g: number; b: number }[] =
-            [];
-
-          // ONLY iterate over the bounding box
-          for (let y = minY; y <= maxY; y++) {
-            if (y % 50 === 0) {
-              await yieldToMain();
-            }
-            for (let x = minX; x <= maxX; x++) {
-              const idx = y * width + x;
-
-              // Only consider currently opaque pixels
-              if (procData[idx * 4 + 3] === 0) continue;
-
-              // Check if it's an edge pixel (has at least one transparent neighbor)
-              let isEdge = false;
-              let transparentNeighbors = 0;
-              for (let dy = -1; dy <= 1; dy++) {
-                for (let dx = -1; dx <= 1; dx++) {
-                  if (dx === 0 && dy === 0) continue;
-                  const nx = x + dx;
-                  const ny = y + dy;
-                  if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                    if (procData[(ny * width + nx) * 4 + 3] === 0) {
-                      isEdge = true;
-                      transparentNeighbors++;
-                    }
-                  }
-                }
-              }
-
-              if (isEdge) {
-                // 1. Boundary Guard: Limit refinement to pixels close to the original background area
-                let nearOrigBg = false;
-                const checkRadius = 4; // limit edge refinement strictly to 4px from original background
-                for (let dy = -checkRadius; dy <= checkRadius && !nearOrigBg; dy++) {
-                  for (let dx = -checkRadius; dx <= checkRadius; dx++) {
-                    const nx = x + dx;
-                    const ny = y + dy;
-                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                      if (isOrigBg[ny * width + nx] === 1) {
-                        nearOrigBg = true;
-                        break;
-                      }
-                    }
-                  }
-                }
-
-                // 2. Color Guard: Is the original color of this pixel a solid foreground color (extremely far from background key)?
-                const origR = originalImageData.data[idx * 4];
-                const origG = originalImageData.data[idx * 4 + 1];
-                const origB = originalImageData.data[idx * 4 + 2];
-                
-                let isSolidForeground = false;
-                if (transparentColor) {
-                  const limitVal = Math.max(120, tolerance + 50);
-                  const limitSqr = limitVal * limitVal;
-                  const distSqr = (origR - transparentColor.r) ** 2 + (origG - transparentColor.g) ** 2 + (origB - transparentColor.b) ** 2;
-                  isSolidForeground = distSqr > limitSqr;
-                }
-
-                // If it's deep inside the foreground body or is a solid foreground color, skip refining it!
-                if (!nearOrigBg || isSolidForeground) {
-                  continue;
-                }
-
-                // Local analysis: find background and foreground color clusters
-                let fgR = 0,
-                  fgG = 0,
-                  fgB = 0,
-                  fgCount = 0;
-                let bgR = 0,
-                  bgG = 0,
-                  bgB = 0,
-                  bgCount = 0;
-
-                for (let dy = -searchRadius; dy <= searchRadius; dy++) {
-                  for (let dx = -searchRadius; dx <= searchRadius; dx++) {
-                    const nx = x + dx;
-                    const ny = y + dy;
-                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                      const nIdx = ny * width + nx;
-                      const alpha = procData[nIdx * 4 + 3];
-                      const r = origDataArray[nIdx * 4];
-                      const g = origDataArray[nIdx * 4 + 1];
-                      const b = origDataArray[nIdx * 4 + 2];
-
-                      if (alpha === 0) {
-                        // Only count as background if it is reasonably close to the original chroma key background color,
-                        // to prevent eroded foreground pixels (which still exist in originalImageData but are marked as alpha 0)
-                        // from corrupting the background mean color towards foreground.
-                        let distToBgKeySqr = 0;
-                        if (transparentColor) {
-                          distToBgKeySqr = (r - transparentColor.r) ** 2 + (g - transparentColor.g) ** 2 + (b - transparentColor.b) ** 2;
-                        }
-                        
-                        if (!transparentColor || distToBgKeySqr < 14400) { // 120^2 = 14400
-                          bgR += r;
-                          bgG += g;
-                          bgB += b;
-                          bgCount++;
-                        }
-                      } else {
-                        // Count strong foreground (pixels not on the very edge)
-                        if (dx !== 0 || dy !== 0) {
-                          fgR += r;
-                          fgG += g;
-                          fgB += b;
-                          fgCount++;
-                        }
-                      }
-                    }
-                  }
-                }
-
-                if (bgCount > 0 && fgCount > 0) {
-                  const bgMeanR = bgR / bgCount;
-                  const bgMeanG = bgG / bgCount;
-                  const bgMeanB = bgB / bgCount;
-
-                  const fgMeanR = fgR / fgCount;
-                  const fgMeanG = fgG / fgCount;
-                  const fgMeanB = fgB / fgCount;
-
-                  const r = origDataArray[idx * 4];
-                  const g = origDataArray[idx * 4 + 1];
-                  const b = origDataArray[idx * 4 + 2];
-
-                  // Distance squared to background vs foreground
-                  const distBgSqr = (r - bgMeanR) ** 2 + (g - bgMeanG) ** 2 + (b - bgMeanB) ** 2;
-                  const distFgSqr = (r - fgMeanR) ** 2 + (g - fgMeanG) ** 2 + (b - fgMeanB) ** 2;
-
-                  // Smart Edge Logic
-                  if (distBgSqr < distFgSqr * 0.25) { // 0.5^2 = 0.25
-                    toErase.push(idx);
-                  } else if (transparentNeighbors >= 5 && distBgSqr < distFgSqr * 0.64) { // 0.8^2 = 0.64
-                    toErase.push(idx);
-                  } else if (pass === passes - 1) {
-                    // In the final pass, instead of erasing, we BLEED the foreground color into the edge pixel!
-                    toRecolor.push({ idx, r: fgMeanR, g: fgMeanG, b: fgMeanB });
-                  }
-                }
-              }
-            }
-          }
-
-          for (const idx of toErase) {
-            newMask[idx] = 0; // Erase in brush mask
-            procData[idx * 4 + 3] = 0; // Temporarily update procData for next pass
-          }
-
-          for (const rc of toRecolor) {
-            // Permanently shift the color of the original image pixel so the halo is eliminated
-            origDataArray[rc.idx * 4] = rc.r;
-            origDataArray[rc.idx * 4 + 1] = rc.g;
-            origDataArray[rc.idx * 4 + 2] = rc.b;
-            newMask[rc.idx] = 1; // Force keep so we don't lose the recolored edge and block flood fill
-          }
-
-          if (toErase.length === 0 && toRecolor.length === 0) break;
-        }
-
-        setOriginalImageData(newOrigData); // Save the color-decontaminated image
-        setBrushMask(newMask); // Triggers processPixels automatically
-      } catch (err) {
-        console.error("Error during AI edge refinement:", err);
-      } finally {
-        setIsRefining(false);
-      }
+    brushMaskRef.current = updatedMask;
+    processedImageDataRef.current = updatedProcessed;
+    setDataVersion(v => v + 1);
   };
 
   /**
@@ -1733,7 +1468,8 @@ export default function Workspace({
     if (!image) return;
     const mask = new Uint8Array(image.naturalWidth * image.naturalHeight);
     mask.fill(255);
-    setBrushMask(mask);
+    brushMaskRef.current = mask;
+    setDataVersion(v => v + 1);
   };
 
   /**
@@ -1913,14 +1649,14 @@ export default function Workspace({
               onClick={() => {
                 const coords = magnifierCoordsRef.current;
                 if (!coords) return;
-                pushToHistory(); // save history before making changes
+                pushToHistory(); // save historyRef.current before making changes
                 const { x, y } = coords;
                 if (workspaceMode === "chroma") {
-                  if (originalImageData) {
-                    const idx = (y * originalImageData.width + x) * 4;
-                    const r = originalImageData.data[idx];
-                    const g = originalImageData.data[idx + 1];
-                    const b = originalImageData.data[idx + 2];
+                  if (originalImageDataRef.current) {
+                    const idx = (y * originalImageDataRef.current.width + x) * 4;
+                    const r = originalImageDataRef.current.data[idx];
+                    const g = originalImageDataRef.current.data[idx + 1];
+                    const b = originalImageDataRef.current.data[idx + 2];
                     setTransparentColor({ r, g, b });
                     setLastPickedCoords({ x, y });
                     if (contiguousMode) {
@@ -1936,9 +1672,9 @@ export default function Workspace({
                     }
                   }
                 } else if (workspaceMode === "smart") {
-                  if (processedImageData) {
+                  if (processedImageDataRef.current) {
                     const rect = findConnectedComponentAt(
-                      processedImageData,
+                      processedImageDataRef.current,
                       x,
                       y,
                       80,
@@ -1973,7 +1709,7 @@ export default function Workspace({
             <button
               id="btn-magnifier-undo"
               onClick={handleUndo}
-              disabled={history.length === 0}
+              disabled={historyCount === 0}
               className="flex-1 min-w-[100px] bg-neutral-800 hover:bg-neutral-700 text-neutral-200 disabled:opacity-40 disabled:hover:bg-neutral-800 font-bold py-2 px-4 rounded-xl transition-all text-xs flex items-center justify-center gap-2 active:scale-95"
             >
               <Undo className="w-4 h-4" />
@@ -1996,15 +1732,16 @@ export default function Workspace({
             <button
               id="btn-magnifier-cancel"
               onClick={() => {
-                if (magnifierBackup) {
-                  setSlices(magnifierBackup.slices);
-                  setManualSeeds(magnifierBackup.manualSeeds);
-                  setTransparentColor(magnifierBackup.transparentColor);
-                  if (magnifierBackup.brushMask) {
-                    setBrushMask(new Uint8Array(magnifierBackup.brushMask));
+                if (magnifierBackupRef.current) {
+                  setSlices(magnifierBackupRef.current.slices);
+                  setManualSeeds(magnifierBackupRef.current.manualSeeds);
+                  setTransparentColor(magnifierBackupRef.current.transparentColor);
+                  if (magnifierBackupRef.current.brushMask) {
+                    brushMaskRef.current = new Uint8Array(magnifierBackupRef.current.brushMask);
                   } else {
-                    setBrushMask(null);
+                    brushMaskRef.current = null;
                   }
+                  setDataVersion(v => v + 1);
                 }
                 setIsMagnifierActive(false);
                 magnifierCoordsRef.current = null;
@@ -2232,37 +1969,6 @@ export default function Workspace({
           </p>
         </div>
 
-        {/* AI Edge Refinement (Experimental) */}
-        <div className="bg-gradient-to-r from-violet-500/10 to-fuchsia-500/10 border border-violet-100 rounded-2xl p-4 shadow-sm flex flex-col gap-3">
-          <div className="flex flex-col">
-            <span className="text-xs font-extrabold text-violet-800 flex items-center gap-1.5">
-              <Sparkles className="w-4 h-4 text-violet-600" />
-              AI очистка краев (Экспериментально)
-            </span>
-            <span className="text-[10.5px] text-neutral-600 leading-normal mt-1">
-              Локальный AI алгоритм точечно вырезает прилипший к краям фон
-              (ореолы), который не смогли убрать внутренние функции.
-            </span>
-          </div>
-          <button
-            onClick={applyAIEdgeRefinement}
-            disabled={isRefining || !processedImageData}
-            className="w-full bg-violet-600 hover:bg-violet-500 disabled:bg-violet-400 text-white font-bold py-2.5 px-4 rounded-xl shadow-md transition-all text-xs flex items-center justify-center gap-2 active:scale-95"
-          >
-            {isRefining ? (
-              <>
-                <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                <span>AI Обработка...</span>
-              </>
-            ) : (
-              <>
-                <Wand2 className="w-3.5 h-3.5" />
-                <span>Запустить AI очистку</span>
-              </>
-            )}
-          </button>
-        </div>
-
         {/* Tab Panel 4: Smart Selection */}
         {workspaceMode === "smart" && (
           <div
@@ -2464,8 +2170,8 @@ export default function Workspace({
             <button
               id="btn-auto-bg"
               onClick={() => {
-                if (originalImageData) {
-                  const autoColor = detectBackgroundColor(originalImageData);
+                if (originalImageDataRef.current) {
+                  const autoColor = detectBackgroundColor(originalImageDataRef.current);
                   setTransparentColor(autoColor);
                   setLastPickedCoords({ x: 0, y: 0 });
                 }
