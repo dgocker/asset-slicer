@@ -1,8 +1,8 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { Download, Copy, Check, Sparkles, Image as ImageIcon, Palette, Loader2, Bot } from 'lucide-react';
+import { Download, Copy, Check, Sparkles, Image as ImageIcon, Palette, Loader2, SlidersHorizontal, X } from 'lucide-react';
 import { Slice, SVGMode, ProcessedAsset, ColorRGB } from '../types';
-import { generateSilhouetteSvg, generateColorLayersSvg, generateEmbeddedSvg, trimTransparentMargins, applySmartEdgeCleanup, cropImageData, applyAILocalEdgeRefinement } from '../utils/imageProcess';
-import { enqueueHeavyTask, yieldToMain } from '../utils/taskQueue';
+import { generateSilhouetteSvg, generateColorLayersSvg, generateEmbeddedSvg, trimTransparentMargins, cropImageData } from '../utils/imageProcess';
+import { enqueueHeavyTask, yieldToMain, getNextTaskVersion } from '../utils/taskQueue';
 
 interface AssetCardProps {
   slice: Slice;
@@ -12,9 +12,15 @@ interface AssetCardProps {
   onAssetUpdated: (asset: ProcessedAsset) => void;
 }
 
-export default React.memo(function AssetCard({ slice, processedImageData, originalImageData, keyColor, onAssetUpdated }: AssetCardProps) {
+export default React.memo(function AssetCard({
+  slice,
+  processedImageData,
+  originalImageData,
+  keyColor,
+  onAssetUpdated
+}: AssetCardProps) {
   const [assetName, setAssetName] = useState(() => (slice.label || 'asset').trim());
-  
+
   useEffect(() => {
     setAssetName((slice.label || 'asset').trim());
   }, [slice.label]);
@@ -22,123 +28,62 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
   const [svgMode, setSvgMode] = useState<SVGMode>('embedded');
   const [trimMargins, setTrimMargins] = useState(true);
   const [keepBackground, setKeepBackground] = useState(false);
-  const [smartEdge, setSmartEdge] = useState(false);
-  const [erodeAmount, setErodeAmount] = useState(1);
   const [embedFormat, setEmbedFormat] = useState<'webp' | 'png'>('webp');
   const [embedQuality, setEmbedQuality] = useState(80);
   const [previewBackground, setPreviewBackground] = useState<'checkerboard' | 'black' | 'white'>('checkerboard');
 
   const [isProcessing, setIsProcessing] = useState(false);
-  
-  // Local AI State
-  const [aiRefinedImageData, setAiRefinedImageData] = useState<ImageData | null>(null);
-  const [isAIRefining, setIsAIRefining] = useState(false);
-
-  // When original/processed image completely changes, reset AI state.
-  // We compare the source data objects themselves.
-  useEffect(() => {
-    setAiRefinedImageData(null);
-  }, [processedImageData, originalImageData, slice.rect.x, slice.rect.y, slice.rect.width, slice.rect.height]);
 
   const [copied, setCopied] = useState(false);
   const [stats, setStats] = useState({ width: 0, height: 0, sizeKb: 0, domColor: '#9ca3af' });
-  
+  const [isZoomOpen, setIsZoomOpen] = useState(false);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const processedAssetRef = useRef<ProcessedAsset | null>(null);
-  
+
   // Track inputs to know what changed
   const lastSourceDataRef = useRef<ImageData | null>(null);
   const lastSourcePixelsRef = useRef<ImageData | null>(null);
   const lastRectRef = useRef<{x: number, y: number, width: number, height: number} | null>(null);
   const lastSettingsRef = useRef<any>(null);
 
-  // AI refinement handler
-  const handleAIRefine = async () => {
-    if (!originalImageData || !processedImageData) return;
-    setIsAIRefining(true);
-    await yieldToMain();
-    
-    try {
-      const croppedOrig = cropImageData(originalImageData, slice.rect);
-      const croppedProc = cropImageData(processedImageData, slice.rect);
-      
-      const refined = await applyAILocalEdgeRefinement(croppedOrig, croppedProc, keyColor || null, 80);
-      setAiRefinedImageData(refined);
-    } catch (error) {
-      console.error("Error during AI refinement:", error);
-    } finally {
-      setIsAIRefining(false);
-    }
-  };
-
   // FAST CANVAS UPDATE: instant visual feedback without blocking or waiting
   useEffect(() => {
     if (!processedImageData || !canvasRef.current) return;
-    
+
     let displayData: ImageData;
-    
-    if (aiRefinedImageData) {
-      const currentSource = aiRefinedImageData;
-      let tightRect = { x: 0, y: 0, width: currentSource.width, height: currentSource.height };
-      if (trimMargins) {
-        tightRect = trimTransparentMargins(currentSource, tightRect);
-      }
-      
-      if (tightRect.width > 0 && tightRect.height > 0) {
-        displayData = cropImageData(currentSource, tightRect);
-        if (smartEdge) {
-          applySmartEdgeCleanup(displayData, erodeAmount, keyColor || null);
-        }
-      } else {
-        return;
-      }
+    const currentSource = (keepBackground && originalImageData) ? originalImageData : processedImageData;
+
+    let tightRect = slice.rect;
+    if (trimMargins) {
+      tightRect = trimTransparentMargins(currentSource, slice.rect);
+    }
+
+    if (tightRect.width > 0 && tightRect.height > 0) {
+      displayData = cropImageData(currentSource, tightRect);
     } else {
-      const currentSource = (keepBackground && originalImageData) ? originalImageData : processedImageData;
-      let tightRect = slice.rect;
-      if (trimMargins) {
-        tightRect = trimTransparentMargins(currentSource, slice.rect);
-      }
-      
-      if (tightRect.width > 0 && tightRect.height > 0) {
-        displayData = cropImageData(currentSource, tightRect);
-        if (smartEdge) {
-          applySmartEdgeCleanup(displayData, erodeAmount, keyColor || null);
-        }
-      } else {
-        return;
-      }
+      return;
     }
 
     canvasRef.current.width = displayData.width;
     canvasRef.current.height = displayData.height;
     const ctx = canvasRef.current.getContext('2d');
     if (ctx) ctx.putImageData(displayData, 0, 0);
-  }, [slice, processedImageData, originalImageData, keyColor, trimMargins, keepBackground, smartEdge, erodeAmount, aiRefinedImageData]);
+  }, [slice, processedImageData, originalImageData, trimMargins, keepBackground]);
 
   const processAsset = useCallback(async () => {
     if (!processedImageData) return;
-    
-    // Which image data to use?
-    let currentSource: ImageData;
-    let baseRect = slice.rect;
-    
-    if (aiRefinedImageData) {
-      currentSource = aiRefinedImageData;
-      baseRect = { x: 0, y: 0, width: currentSource.width, height: currentSource.height };
-    } else {
-      currentSource = (keepBackground && originalImageData) ? originalImageData : processedImageData;
-    }
-    
-    const settings = { trimMargins, smartEdge, erodeAmount, embedFormat, embedQuality, svgMode, assetName, keyColor, aiRefinedImageData };
+
+    const settings = { trimMargins, embedFormat, embedQuality, svgMode, assetName, keyColor };
     const settingsChanged = JSON.stringify(settings) !== JSON.stringify(lastSettingsRef.current);
-    
+
     // Fast check: if source identity and rect and settings are identical, return immediately.
     let possibleSourceChange = true;
-    if (lastSourceDataRef.current === currentSource && 
-        lastRectRef.current?.x === baseRect.x &&
-        lastRectRef.current?.y === baseRect.y &&
-        lastRectRef.current?.width === baseRect.width &&
-        lastRectRef.current?.height === baseRect.height) {
+    if (lastSourceDataRef.current === processedImageData &&
+        lastRectRef.current?.x === slice.rect.x &&
+        lastRectRef.current?.y === slice.rect.y &&
+        lastRectRef.current?.width === slice.rect.width &&
+        lastRectRef.current?.height === slice.rect.height) {
       possibleSourceChange = false;
     }
 
@@ -147,11 +92,12 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
     }
 
     // Crop the current region to do a fast pixel comparison before queueing
-    const currentSlicePixels = cropImageData(currentSource, baseRect);
-    
+    const currentSource = (keepBackground && originalImageData) ? originalImageData : processedImageData;
+    const currentSlicePixels = cropImageData(currentSource, slice.rect);
+
     let pixelsChanged = true;
-    if (lastSourcePixelsRef.current && 
-        lastSourcePixelsRef.current.width === currentSlicePixels.width && 
+    if (lastSourcePixelsRef.current &&
+        lastSourcePixelsRef.current.width === currentSlicePixels.width &&
         lastSourcePixelsRef.current.height === currentSlicePixels.height) {
       const oldData = lastSourcePixelsRef.current.data;
       const newData = currentSlicePixels.data;
@@ -173,20 +119,20 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
 
     setIsProcessing(true);
 
+    const version = getNextTaskVersion(slice.id);
+
     // Enter heavy task queue to avoid blocking main thread with simultaneous crops/SVG tracing
     // It will run AFTER the user stops moving the slider, because the queue/debounce will handle it
     const result = await enqueueHeavyTask(async () => {
-      let tightRect = baseRect;
-      if (trimMargins) {
-        tightRect = trimTransparentMargins(currentSource, baseRect);
-      }
-      
-      if (tightRect.width <= 0 || tightRect.height <= 0) return { skipped: true, currentSlicePixels };
+      let displayData: ImageData;
+      let tightRect = slice.rect;
 
-      const displayData = cropImageData(currentSource, tightRect);
-      if (smartEdge) {
-        applySmartEdgeCleanup(displayData, erodeAmount, keyColor || null);
+      if (trimMargins) {
+        tightRect = trimTransparentMargins(currentSource, slice.rect);
       }
+
+      if (tightRect.width <= 0 || tightRect.height <= 0) return { skipped: true, currentSlicePixels };
+      displayData = cropImageData(currentSource, tightRect);
 
       // 2. Data URLs
       const tempCanvas = document.createElement('canvas');
@@ -238,11 +184,11 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
         displayData,
         rawSlicePixels: currentSlicePixels
       };
-    });
+    }, slice.id, version);
 
     if (result) {
       if ('skipped' in result && result.skipped) {
-        lastSourceDataRef.current = currentSource;
+        lastSourceDataRef.current = processedImageData;
         lastRectRef.current = { ...slice.rect };
         lastSourcePixelsRef.current = result.currentSlicePixels;
         lastSettingsRef.current = settings;
@@ -250,12 +196,12 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
         return;
       }
 
-      lastSourceDataRef.current = currentSource;
+      lastSourceDataRef.current = processedImageData;
       lastRectRef.current = { ...slice.rect };
       lastSourcePixelsRef.current = (result as any).rawSlicePixels;
       lastSettingsRef.current = settings;
       processedAssetRef.current = (result as any).asset;
-      
+
       setStats({
         width: (result as any).asset.width,
         height: (result as any).asset.height,
@@ -265,9 +211,9 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
 
       onAssetUpdated((result as any).asset);
     }
-    
+
     setIsProcessing(false);
-  }, [slice, processedImageData, originalImageData, keyColor, trimMargins, keepBackground, smartEdge, erodeAmount, embedFormat, embedQuality, svgMode, assetName, onAssetUpdated]);
+  }, [slice, processedImageData, originalImageData, keyColor, trimMargins, keepBackground, embedFormat, embedQuality, svgMode, assetName, onAssetUpdated]);
 
   useEffect(() => {
     // Debounce the entire process slightly more so it doesn't queue 100 tasks while dragging
@@ -277,6 +223,13 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
     return () => clearTimeout(timer);
   }, [processAsset]);
 
+  useEffect(() => {
+    return () => {
+      // Invalidate any pending tasks for this slice on unmount
+      getNextTaskVersion(slice.id);
+    };
+  }, [slice.id]);
+
   const handleCopyCode = () => {
     if (!processedAssetRef.current) return;
     navigator.clipboard.writeText(processedAssetRef.current.svgCode);
@@ -284,33 +237,33 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleDownloadSVG = () => {
+  const handleDownloadSVG = async () => {
     if (!processedAssetRef.current) return;
-    const blob = new Blob([processedAssetRef.current.svgCode], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${processedAssetRef.current.name}.svg`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      const { downloadTextFile } = await import('../utils/downloadHelper');
+      await downloadTextFile(`${processedAssetRef.current.name}.svg`, processedAssetRef.current.svgCode);
+    } catch (err) {
+      console.error('Failed to download SVG:', err);
+      alert('Ошибка при скачивании SVG: ' + String(err));
+    }
   };
 
-  const handleDownloadPNG = () => {
+  const handleDownloadPNG = async () => {
     if (!processedAssetRef.current) return;
-    const a = document.createElement('a');
-    a.href = processedAssetRef.current.rasterDataUrl || processedAssetRef.current.pngDataUrl;
-    const ext = processedAssetRef.current.rasterFormat || 'png';
-    a.download = `${processedAssetRef.current.name}.${ext}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    try {
+      const ext = processedAssetRef.current.rasterFormat || 'png';
+      const rasterUrl = processedAssetRef.current.rasterDataUrl || processedAssetRef.current.pngDataUrl;
+      const { downloadBinaryFile } = await import('../utils/downloadHelper');
+      await downloadBinaryFile(`${processedAssetRef.current.name}.${ext}`, rasterUrl);
+    } catch (err) {
+      console.error('Failed to download PNG:', err);
+      alert('Ошибка при скачивании изображения: ' + String(err));
+    }
   };
 
   return (
     <div className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm hover:shadow-md transition-all flex flex-col md:flex-row gap-5 items-stretch relative">
-      <div 
+      <div
         className={`flex flex-col sm:flex-row md:flex-col gap-3 justify-center items-center rounded-xl p-4 border relative overflow-hidden group transition-all duration-300 min-w-[140px] md:w-[160px] ${
           previewBackground === 'checkerboard' ? 'bg-neutral-50 border-neutral-100' :
           previewBackground === 'black' ? 'bg-black border-neutral-900 shadow-inner' : 'bg-white border-neutral-200 shadow-inner'
@@ -323,7 +276,7 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
         </div>
 
         {previewBackground === 'checkerboard' && (
-          <div 
+          <div
             className="absolute inset-0 opacity-5 pointer-events-none"
             style={{
               backgroundImage: `linear-gradient(45deg, #1e293b 25%, transparent 25%), linear-gradient(-45deg, #1e293b 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #1e293b 75%), linear-gradient(-45deg, transparent 75%, #1e293b 75%)`,
@@ -333,7 +286,11 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
           />
         )}
 
-        <div className="w-20 h-20 md:w-24 md:h-24 flex items-center justify-center relative z-10 p-1">
+        <div
+          onClick={() => setIsZoomOpen(true)}
+          className="w-20 h-20 md:w-24 md:h-24 flex items-center justify-center relative z-10 p-1 cursor-zoom-in hover:scale-105 transition-transform duration-200"
+          title="Нажмите, чтобы увеличить и рассмотреть"
+        >
           <div className="relative w-full h-full flex items-center justify-center">
             <canvas
               ref={canvasRef}
@@ -389,73 +346,6 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
                 <span className="w-4 h-4 rounded-full bg-white shadow-sm transition-all" />
               </button>
             </div>
-
-            <div className="flex flex-col gap-2 p-2.5 bg-neutral-50 border border-neutral-100/85 rounded-xl">
-              <div className="flex items-center justify-between">
-                <div className="flex flex-col gap-0.5 pr-2">
-                  <span className="text-xs font-bold text-neutral-800 flex items-center gap-1.5">
-                    <Sparkles className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                    Умное удаление каймы
-                  </span>
-                  <p className="text-[10px] text-neutral-500 leading-normal">Устраняет остаточный белый ореол по краям.</p>
-                </div>
-                <button onClick={() => setSmartEdge(prev => !prev)} type="button" className={`w-10 h-6 flex items-center rounded-full p-1 transition-all shrink-0 ${smartEdge ? 'bg-amber-500 justify-end' : 'bg-neutral-200 justify-start'}`}>
-                  <span className="w-4 h-4 rounded-full bg-white shadow-sm transition-all" />
-                </button>
-              </div>
-              {smartEdge && (
-                <div className="mt-1 pt-2 border-t border-neutral-200/50 flex gap-2 animate-fadeIn">
-                  {[0, 1, 2, 3].map((val) => (
-                    <button key={val} onClick={() => setErodeAmount(val)} type="button" className={`flex-1 py-1 text-[9px] font-bold rounded-lg transition-all border ${erodeAmount === val ? 'bg-neutral-900 border-neutral-900 text-white' : 'bg-white border-neutral-200 text-neutral-600'}`}>
-                      {val === 0 ? 'Без сужения' : `${val} px`}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Local AI Refinement */}
-            <div className="flex flex-col gap-2 p-2.5 bg-gradient-to-r from-violet-500/10 to-fuchsia-500/10 border border-violet-100 rounded-xl">
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex flex-col gap-0.5 pr-2">
-                    <span className="text-xs font-bold text-violet-800 flex items-center gap-1.5">
-                      <Bot className="w-3.5 h-3.5 text-violet-600 shrink-0" />
-                      AI Очистка ассета
-                    </span>
-                    <p className="text-[10px] text-violet-600/70 leading-normal">Точечный анализ контуров для этого элемента.</p>
-                  </div>
-                </div>
-                
-                {aiRefinedImageData ? (
-                  <div className="flex items-center justify-between text-[10px] font-bold text-violet-700 bg-violet-100 p-2 rounded-lg">
-                    <div className="flex items-center gap-1.5">
-                      <Check className="w-3.5 h-3.5" />
-                      <span>Обработан</span>
-                    </div>
-                    <button onClick={() => setAiRefinedImageData(null)} className="text-red-500 hover:text-red-700 px-2 py-0.5 transition-all">Сбросить</button>
-                  </div>
-                ) : (
-                  <button 
-                    onClick={handleAIRefine}
-                    disabled={isAIRefining}
-                    className="w-full bg-violet-600 hover:bg-violet-500 disabled:bg-violet-400 text-white font-bold py-2 px-3 rounded-lg shadow-sm transition-all text-[11px] flex items-center justify-center gap-2 active:scale-95"
-                  >
-                    {isAIRefining ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>Обработка...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles className="w-3 h-3" />
-                        <span>Запустить очистку</span>
-                      </>
-                    )}
-                  </button>
-                )}
-              </div>
-            </div>
           </div>
 
           <div>
@@ -496,6 +386,94 @@ export default React.memo(function AssetCard({ slice, processedImageData, origin
           </button>
         </div>
       </div>
+
+      {/* High-resolution fullscreen preview Zoom Modal */}
+      {isZoomOpen && (
+        <div className="fixed inset-0 bg-neutral-950/85 backdrop-blur-md flex flex-col items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+          <div className="bg-neutral-900 border border-neutral-800 rounded-3xl p-5 sm:p-6 shadow-2xl max-w-2xl w-full flex flex-col items-stretch gap-4 relative max-h-[90vh] animate-in zoom-in-95 duration-250">
+            
+            {/* Header */}
+            <div className="flex justify-between items-center pb-3 border-b border-neutral-800">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-violet-400" />
+                <span className="text-sm font-bold text-neutral-100 uppercase tracking-wide">Детальный осмотр: {assetName}</span>
+              </div>
+              <button 
+                onClick={() => setIsZoomOpen(false)}
+                className="w-8 h-8 rounded-full bg-neutral-800 hover:bg-neutral-750 flex items-center justify-center text-neutral-400 hover:text-neutral-200 border border-neutral-700 transition-all cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Background selection for the preview inside modal */}
+            <div className="flex justify-end gap-1.5 bg-neutral-950/50 p-1.5 rounded-xl border border-neutral-800/80 self-end">
+              <button 
+                onClick={() => setPreviewBackground('checkerboard')} 
+                className={`px-3 py-1.5 text-[10px] font-bold rounded-lg transition-all ${
+                  previewBackground === 'checkerboard' ? 'bg-neutral-800 text-white border border-neutral-700' : 'text-neutral-400 hover:text-neutral-250 border border-transparent'
+                }`}
+              >
+                🏁 Шахматка
+              </button>
+              <button 
+                onClick={() => setPreviewBackground('black')} 
+                className={`px-3 py-1.5 text-[10px] font-bold rounded-lg transition-all ${
+                  previewBackground === 'black' ? 'bg-black text-white border border-neutral-900' : 'text-neutral-400 hover:text-neutral-250 border border-transparent'
+                }`}
+              >
+                ⚫ Чёрный
+              </button>
+              <button 
+                onClick={() => setPreviewBackground('white')} 
+                className={`px-3 py-1.5 text-[10px] font-bold rounded-lg transition-all ${
+                  previewBackground === 'white' ? 'bg-white text-black border border-neutral-200' : 'text-neutral-450 hover:text-neutral-600 border border-transparent'
+                }`}
+              >
+                ⚪ Белый
+              </button>
+            </div>
+
+            {/* Large Image Viewport */}
+            <div 
+              className={`flex-1 min-h-[250px] sm:min-h-[350px] rounded-2xl border flex items-center justify-center relative overflow-hidden p-6 transition-all duration-300 ${
+                previewBackground === 'checkerboard' ? 'bg-neutral-950 border-neutral-850' :
+                previewBackground === 'black' ? 'bg-black border-neutral-950' : 'bg-white border-neutral-200'
+              }`}
+            >
+              {previewBackground === 'checkerboard' && (
+                <div
+                  className="absolute inset-0 opacity-10 pointer-events-none"
+                  style={{
+                    backgroundImage: `linear-gradient(45deg, #475569 25%, transparent 25%), linear-gradient(-45deg, #475569 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #475569 75%), linear-gradient(-45deg, transparent 75%, #475569 75%)`,
+                    backgroundSize: '24px 24px',
+                    backgroundPosition: '0 0, 0 12px, 12px -12px, -12px 0px'
+                  }}
+                />
+              )}
+
+              {processedAssetRef.current ? (
+                <img 
+                  src={processedAssetRef.current.pngDataUrl || processedAssetRef.current.rasterDataUrl} 
+                  alt={assetName} 
+                  className="max-w-full max-h-[45vh] object-contain relative z-10 shadow-lg select-none"
+                />
+              ) : (
+                <div className="flex flex-col items-center justify-center gap-3 text-neutral-400">
+                  <Loader2 className="w-8 h-8 animate-spin text-violet-400" />
+                  <span className="text-xs font-semibold">Генерация предпросмотра...</span>
+                </div>
+              )}
+            </div>
+
+            {/* Bottom Meta */}
+            <div className="flex justify-between items-center text-[10px] font-mono text-neutral-500 px-1 pt-1.5 border-t border-neutral-800/60">
+              <span>Разрешение: {stats.width} × {stats.height} px</span>
+              <span>Размер SVG: {stats.sizeKb} КБ</span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 });

@@ -50,6 +50,7 @@ function useDebounce<T>(value: T, delay: number): T {
 
 interface WorkspaceProps {
   imageSrc: string;
+  aiImageSrc?: string | null;
   onSlicesUpdated: (
     slices: Slice[],
     processedImageData: ImageData,
@@ -61,11 +62,13 @@ interface WorkspaceProps {
 
 export default function Workspace({
   imageSrc,
+  aiImageSrc,
   onSlicesUpdated,
   onReset,
 }: WorkspaceProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Image element ref
   const [image, setImage] = useState<HTMLImageElement | null>(null);
@@ -109,6 +112,7 @@ export default function Workspace({
 
   // Pixel data buffers
   const originalImageDataRef = useRef<ImageData | null>(null);
+  const aiImageDataRef = useRef<ImageData | null>(null);
   const brushMaskRef = useRef<Uint8Array | null>(null); // 0 = erased, 1 = restored, 255 = default (chroma key)
   const processedImageDataRef = useRef<ImageData | null>(null);
   const [dataVersion, setDataVersion] = useState(0);
@@ -126,6 +130,37 @@ export default function Workspace({
     "chroma" | "brush" | "slice" | "smart"
   >("chroma");
   const [snapToEdges, setSnapToEdges] = useState(true);
+
+  // Active step in the sidebar workflow: 'bg' (background cleanup), 'slice' (slicing), 'objects' (objects list)
+  const [activeStep, setActiveStep] = useState<"bg" | "slice" | "objects">("bg");
+  const [bgSubMode, setBgSubMode] = useState<"chroma" | "brush">("chroma");
+  const [sliceSubMode, setSliceSubMode] = useState<"manual" | "smart">("manual");
+
+  // Automatically switch workspace modes when activeStep or sub-modes change
+  useEffect(() => {
+    if (activeStep === "bg") {
+      if (bgSubMode === "chroma") {
+        setWorkspaceMode("chroma");
+        setBrushMode("none");
+      } else {
+        setWorkspaceMode("brush");
+        if (brushMode === "none") {
+          setBrushMode("erase");
+        }
+      }
+    } else if (activeStep === "slice") {
+      if (sliceSubMode === "manual") {
+        setWorkspaceMode("slice");
+        setBrushMode("none");
+      } else if (sliceSubMode === "smart") {
+        setWorkspaceMode("smart");
+        setBrushMode("none");
+      }
+    } else if (activeStep === "objects") {
+      setWorkspaceMode("slice"); // Neutral mode for selecting slices
+      setBrushMode("none");
+    }
+  }, [activeStep, bgSubMode, sliceSubMode]);
 
   // Zoom and Pan states
   const [zoom, setZoom] = useState<number>(1);
@@ -161,6 +196,54 @@ export default function Workspace({
       panelRectRef.current = panelRef.current.getBoundingClientRect();
     }
   };
+
+  // Invalidate cached rects on zoom or workspaceMode change
+  useEffect(() => {
+    canvasRectRef.current = null;
+    panelRectRef.current = null;
+  }, [zoom, workspaceMode]);
+
+  // Invalidate cached rects and calculate dimensions on window resize
+  useEffect(() => {
+    const handleResize = () => {
+      canvasRectRef.current = null;
+      panelRectRef.current = null;
+
+      const canvas = canvasRef.current;
+      const parent = containerRef.current;
+      if (canvas && parent) {
+        const imgW = canvas.width;
+        const imgH = canvas.height;
+        if (imgW > 0 && imgH > 0) {
+          const targetW = parent.clientWidth - 32;
+          const targetH = 480;
+          const scale = Math.min(targetW / imgW, targetH / imgH);
+          baseWidthRef.current = imgW * scale;
+          baseHeightRef.current = imgH * scale;
+        }
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, []);
+
+  // Invalidate cached rects on container scroll or wheel
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const handleScrollOrWheel = () => {
+      canvasRectRef.current = null;
+      panelRectRef.current = null;
+    };
+    container.addEventListener("scroll", handleScrollOrWheel, { passive: true });
+    container.addEventListener("wheel", handleScrollOrWheel, { passive: true });
+    return () => {
+      container.removeEventListener("scroll", handleScrollOrWheel);
+      container.removeEventListener("wheel", handleScrollOrWheel);
+    };
+  }, [containerRef.current]);
 
   // Magnifier button press timer and hold-state refs
   const buttonPressTimerRef = useRef<number | null>(null);
@@ -270,16 +353,27 @@ export default function Workspace({
       transparentColor: transparentColor ? { ...transparentColor } : null,
       brushMask: maskCopy,
     });
-    if (historyCount > 25) {
+
+    let maxStates = 25;
+    if (brushMaskRef.current) {
+      const pixelCount = brushMaskRef.current.length;
+      if (pixelCount > 4000000) {
+        maxStates = 5;
+      } else if (pixelCount > 1000000) {
+        maxStates = 12;
+      }
+    }
+
+    while (historyRef.current.length > maxStates) {
       historyRef.current.shift();
     }
-    setHistoryCount(historyCount);
+    setHistoryCount(historyRef.current.length);
   };
 
   const handleUndo = () => {
-    if (historyCount === 0) return;
+    if (historyRef.current.length === 0) return;
     const prevState = historyRef.current.pop();
-    setHistoryCount(historyCount);
+    setHistoryCount(historyRef.current.length);
     if (prevState) {
       setSlices(prevState.slices);
       setManualSeeds(prevState.manualSeeds);
@@ -425,9 +519,22 @@ export default function Workspace({
 
   // Load image on mount
   useEffect(() => {
+    if (!imageSrc) return;
+    historyRef.current = [];
+    setHistoryCount(0);
+    let active = true;
     const img = new Image();
-    img.crossOrigin = "anonymous";
+    let aiImg: HTMLImageElement | null = null;
+
+    const setCrossOriginIfRemote = (targetImg: HTMLImageElement, srcUrl: string) => {
+      if (srcUrl.startsWith("http") && !srcUrl.includes("localhost") && !srcUrl.includes("127.0.0.1")) {
+        targetImg.crossOrigin = "anonymous";
+      }
+    };
+
+    setCrossOriginIfRemote(img, imageSrc);
     img.onload = () => {
+      if (!active) return;
       setImage(img);
 
       // Create offscreen canvas to extract pixels
@@ -446,21 +553,71 @@ export default function Workspace({
         originalImageDataRef.current = imgData;
         setDataVersion(v => v + 1);
 
-        // Auto-detect dominant background color
-        const detectedBg = detectBackgroundColor(imgData);
-        setTransparentColor(detectedBg);
-        setLastPickedCoords({ x: 0, y: 0 });
-        setManualSeeds([]);
-
         // Initialize brush mask
         const mask = new Uint8Array(img.naturalWidth * img.naturalHeight);
         mask.fill(255); // Fill with default
         brushMaskRef.current = mask;
-        setDataVersion(v => v + 1);
+
+        // Disable automatic chroma-keying by default
+        setTransparentColor(null);
+        setLastPickedCoords({ x: 0, y: 0 });
+        setManualSeeds([]);
+
+        // If AI-cleaned image is provided, load it to initialize processedImageDataRef and aiImageDataRef
+        if (aiImageSrc) {
+          aiImg = new Image();
+          setCrossOriginIfRemote(aiImg, aiImageSrc);
+          aiImg.onload = () => {
+            if (!active) return;
+            const aiCanvas = document.createElement("canvas");
+            aiCanvas.width = aiImg!.naturalWidth;
+            aiCanvas.height = aiImg!.naturalHeight;
+            const aiCtx = aiCanvas.getContext("2d");
+            if (aiCtx) {
+              aiCtx.drawImage(aiImg!, 0, 0);
+              const aiImgData = aiCtx.getImageData(
+                0,
+                0,
+                aiImg!.naturalWidth,
+                aiImg!.naturalHeight,
+              );
+
+              aiImageDataRef.current = aiImgData;
+              processedImageDataRef.current = aiImgData;
+              setDataVersion(v => v + 1);
+            }
+          };
+          aiImg.onerror = () => {
+            if (!active) return;
+          };
+          aiImg.src = aiImageSrc;
+        } else {
+          aiImageDataRef.current = null;
+          // Otherwise, initialize processedImageDataRef with the original image
+          processedImageDataRef.current = new ImageData(
+            new Uint8ClampedArray(imgData.data),
+            imgData.width,
+            imgData.height
+          );
+          setDataVersion(v => v + 1);
+        }
       }
     };
+    img.onerror = () => {
+      if (!active) return;
+    };
     img.src = imageSrc;
-  }, [imageSrc]);
+
+    return () => {
+      active = false;
+      img.onload = null;
+      img.onerror = null;
+      if (aiImg) {
+        aiImg.onload = null;
+        aiImg.onerror = null;
+      }
+    };
+  }, [imageSrc, aiImageSrc]);
 
   // Ref to track last parameters that triggered auto-detection
   const lastDetectParamsRef = useRef<{
@@ -490,6 +647,11 @@ export default function Workspace({
   // Handle updates to transparency and slicing configurations
   useEffect(() => {
     if (!originalImageDataRef.current || !brushMaskRef.current || !image) return;
+
+    // If AI image is specified but not yet loaded, wait for it to prevent flash/race conditions
+    if (aiImageSrc && !aiImageDataRef.current) {
+      return;
+    }
 
     // Skip heavy calculations while actively drawing/brushing to prevent lag
     if (isDrawing) {
@@ -651,6 +813,7 @@ export default function Workspace({
     image,
     isDrawing,
     autoDetectEnabled,
+    aiImageSrc,
   ]);
 
   // Redraw canvas locally on any visual changes (including active drawing/dragging)
@@ -705,8 +868,9 @@ export default function Workspace({
     contiguous: boolean,
     pickedCoords: { x: number; y: number } | null,
   ): ImageData => {
+    const baseData = aiImageDataRef.current || src;
     const output = new ImageData(
-      new Uint8ClampedArray(src.data),
+      new Uint8ClampedArray(baseData.data),
       src.width,
       src.height,
     );
@@ -720,15 +884,16 @@ export default function Workspace({
       let qHead = 0;
       let qTail = 0;
       const propTol = tol + softness * 0.4; // Tightened propagation threshold to prevent crossing semi-transparent edge boundaries
+      const propTolSqr = propTol * propTol;
 
       const pushPixel = (idx: number) => {
         if (isBackground[idx] === 0 && mask[idx] !== 1) {
           const pxIdx = idx * 4;
-          const r = data[pxIdx];
-          const g = data[pxIdx + 1];
-          const b = data[pxIdx + 2];
-          const dist = getColorDistance({ r, g, b }, keyColor);
-          if (dist <= propTol) {
+          const dr = data[pxIdx] - keyColor.r;
+          const dg = data[pxIdx + 1] - keyColor.g;
+          const db = data[pxIdx + 2] - keyColor.b;
+          const distSqr = dr * dr + dg * dg + db * db;
+          if (distSqr <= propTolSqr) {
             isBackground[idx] = 1;
             queue[qTail++] = idx;
           }
@@ -765,11 +930,11 @@ export default function Workspace({
           const nIdx = currIdx - 1;
           if (isBackground[nIdx] === 0) {
             const nPxIdx = nIdx * 4;
-            const dist = getColorDistance(
-              { r: data[nPxIdx], g: data[nPxIdx + 1], b: data[nPxIdx + 2] },
-              keyColor,
-            );
-            if (dist <= propTol) {
+            const dr = data[nPxIdx] - keyColor.r;
+            const dg = data[nPxIdx + 1] - keyColor.g;
+            const db = data[nPxIdx + 2] - keyColor.b;
+            const distSqr = dr * dr + dg * dg + db * db;
+            if (distSqr <= propTolSqr) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
             }
@@ -780,11 +945,11 @@ export default function Workspace({
           const nIdx = currIdx + 1;
           if (isBackground[nIdx] === 0) {
             const nPxIdx = nIdx * 4;
-            const dist = getColorDistance(
-              { r: data[nPxIdx], g: data[nPxIdx + 1], b: data[nPxIdx + 2] },
-              keyColor,
-            );
-            if (dist <= propTol) {
+            const dr = data[nPxIdx] - keyColor.r;
+            const dg = data[nPxIdx + 1] - keyColor.g;
+            const db = data[nPxIdx + 2] - keyColor.b;
+            const distSqr = dr * dr + dg * dg + db * db;
+            if (distSqr <= propTolSqr) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
             }
@@ -795,11 +960,11 @@ export default function Workspace({
           const nIdx = currIdx - width;
           if (isBackground[nIdx] === 0) {
             const nPxIdx = nIdx * 4;
-            const dist = getColorDistance(
-              { r: data[nPxIdx], g: data[nPxIdx + 1], b: data[nPxIdx + 2] },
-              keyColor,
-            );
-            if (dist <= propTol) {
+            const dr = data[nPxIdx] - keyColor.r;
+            const dg = data[nPxIdx + 1] - keyColor.g;
+            const db = data[nPxIdx + 2] - keyColor.b;
+            const distSqr = dr * dr + dg * dg + db * db;
+            if (distSqr <= propTolSqr) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
             }
@@ -810,11 +975,11 @@ export default function Workspace({
           const nIdx = currIdx + width;
           if (isBackground[nIdx] === 0) {
             const nPxIdx = nIdx * 4;
-            const dist = getColorDistance(
-              { r: data[nPxIdx], g: data[nPxIdx + 1], b: data[nPxIdx + 2] },
-              keyColor,
-            );
-            if (dist <= propTol) {
+            const dr = data[nPxIdx] - keyColor.r;
+            const dg = data[nPxIdx + 1] - keyColor.g;
+            const db = data[nPxIdx + 2] - keyColor.b;
+            const distSqr = dr * dr + dg * dg + db * db;
+            if (distSqr <= propTolSqr) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
             }
@@ -823,34 +988,56 @@ export default function Workspace({
       }
     }
 
-    for (let i = 0; i < data.length; i += 4) {
-      const idx = i / 4;
-      const maskVal = mask[idx];
+    if (keyColor) {
+      const tolSqr = tol * tol;
+      const maxTol = tol + softness * 2;
+      const maxTolSqr = maxTol * maxTol;
+      const softness2 = softness * 2;
 
-      if (maskVal === 0) {
-        // Erased by brush
-        data[i + 3] = 0;
-      } else if (maskVal === 1) {
-        // Forced keep by brush (preserve original alpha)
-        // do nothing, keeps src alpha
-      } else {
-        // Default: apply chroma key
-        if (keyColor) {
+      for (let i = 0; i < data.length; i += 4) {
+        const idx = i / 4;
+        const maskVal = mask[idx];
+
+        if (maskVal === 0) {
+          data[i + 3] = 0;
+        } else if (maskVal === 1) {
+          data[i] = src.data[i];
+          data[i + 1] = src.data[i + 1];
+          data[i + 2] = src.data[i + 2];
+          data[i + 3] = src.data[i + 3];
+        } else {
           if (contiguous && isBackground[idx] === 0) {
-            continue; // Protect internal details since it's not connected to background borders
+            continue;
           }
 
           const r = data[i];
           const g = data[i + 1];
           const b = data[i + 2];
-          const dist = getColorDistance({ r, g, b }, keyColor);
-          if (dist <= tol) {
+          const dr = r - keyColor.r;
+          const dg = g - keyColor.g;
+          const db = b - keyColor.b;
+          const distSqr = dr * dr + dg * dg + db * db;
+
+          if (distSqr <= tolSqr) {
             data[i + 3] = 0;
-          } else if (softness > 0 && dist < tol + softness * 2) {
-            // Smoothly interpolate transparency (anti-aliasing in color space)
-            const ratio = (dist - tol) / (softness * 2);
+          } else if (softness > 0 && distSqr < maxTolSqr) {
+            const dist = Math.sqrt(distSqr);
+            const ratio = (dist - tol) / softness2;
             data[i + 3] = Math.min(data[i + 3], Math.round(255 * ratio));
           }
+        }
+      }
+    } else {
+      for (let i = 0; i < data.length; i += 4) {
+        const idx = i / 4;
+        const maskVal = mask[idx];
+        if (maskVal === 0) {
+          data[i + 3] = 0;
+        } else if (maskVal === 1) {
+          data[i] = src.data[i];
+          data[i + 1] = src.data[i + 1];
+          data[i + 2] = src.data[i + 2];
+          data[i + 3] = src.data[i + 3];
         }
       }
     }
@@ -875,13 +1062,18 @@ export default function Workspace({
 
     // Measure actual layout size on screen when at 1x zoom for base scaling
     if (zoom === 1) {
-      setTimeout(() => {
-        const rect = canvas.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          baseWidthRef.current = rect.width;
-          baseHeightRef.current = rect.height;
+      const parent = containerRef.current;
+      if (parent) {
+        const imgW = imgData.width;
+        const imgH = imgData.height;
+        if (imgW > 0 && imgH > 0) {
+          const targetW = parent.clientWidth - 32;
+          const targetH = 480;
+          const scale = Math.min(targetW / imgW, targetH / imgH);
+          baseWidthRef.current = imgW * scale;
+          baseHeightRef.current = imgH * scale;
         }
-      }, 0);
+      }
     }
 
     const renderOverlays = () => {
@@ -975,9 +1167,12 @@ export default function Workspace({
       // Force texture upload for hardware acceleration to prevent severe lag
       // when the magnifier uses drawImage for the first time.
       try {
-        const offscreen = document.createElement("canvas");
-        offscreen.width = 1;
-        offscreen.height = 1;
+        if (!offscreenCanvasRef.current) {
+          offscreenCanvasRef.current = document.createElement("canvas");
+          offscreenCanvasRef.current.width = 1;
+          offscreenCanvasRef.current.height = 1;
+        }
+        const offscreen = offscreenCanvasRef.current;
         const offCtx = offscreen.getContext("2d");
         if (offCtx) offCtx.drawImage(canvas, 0, 0, 1, 1, 0, 0, 1, 1);
       } catch (e) {
@@ -1004,12 +1199,17 @@ export default function Workspace({
       canvasRectRef.current = rect;
     }
 
-    // Scale mapping factor
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+    const adjustedLeft = rect.left + 1;
+    const adjustedTop = rect.top + 1;
+    const adjustedWidth = rect.width - 2;
+    const adjustedHeight = rect.height - 2;
 
-    const x = Math.round((clientX - rect.left) * scaleX);
-    const y = Math.round((clientY - rect.top) * scaleY);
+    // Scale mapping factor
+    const scaleX = canvas.width / adjustedWidth;
+    const scaleY = canvas.height / adjustedHeight;
+
+    const x = Math.round((clientX - adjustedLeft) * scaleX);
+    const y = Math.round((clientY - adjustedTop) * scaleY);
 
     return {
       x: Math.max(0, Math.min(canvas.width - 1, x)),
@@ -1124,6 +1324,8 @@ export default function Workspace({
           scrollLeft: containerRef.current.scrollLeft,
           scrollTop: containerRef.current.scrollTop,
         };
+        canvasRectRef.current = null;
+        panelRectRef.current = null;
       }
       return;
     }
@@ -1226,6 +1428,8 @@ export default function Workspace({
           const dy = clientY - panStartRef.current.y;
           containerRef.current.scrollLeft = panStartRef.current.scrollLeft - dx;
           containerRef.current.scrollTop = panStartRef.current.scrollTop - dy;
+          canvasRectRef.current = null;
+          panelRectRef.current = null;
         }
       }
       return;
@@ -1363,7 +1567,7 @@ export default function Workspace({
           processedImageDataRef.current,
           finalCoords.x,
           finalCoords.y,
-          80,
+          1,
           padding,
         );
         if (rect) {
@@ -1450,8 +1654,11 @@ export default function Workspace({
           if (maskVal === 0) {
             updatedProcessed.data[idx * 4 + 3] = 0; // Erase
           } else {
-            updatedProcessed.data[idx * 4 + 3] =
-              originalImageDataRef.current.data[idx * 4 + 3]; // Restore original alpha
+            const pxIdx = idx * 4;
+            updatedProcessed.data[pxIdx] = originalImageDataRef.current.data[pxIdx];
+            updatedProcessed.data[pxIdx + 1] = originalImageDataRef.current.data[pxIdx + 1];
+            updatedProcessed.data[pxIdx + 2] = originalImageDataRef.current.data[pxIdx + 2];
+            updatedProcessed.data[pxIdx + 3] = originalImageDataRef.current.data[pxIdx + 3];
           }
         }
       }
@@ -1473,13 +1680,27 @@ export default function Workspace({
   };
 
   /**
+   * Removes a slice by its ID and clears it from allTimeAutoSlicesRef cache.
+   */
+  const deleteSliceById = (idToDelete: string) => {
+    const remaining = slices.filter((s) => s.id !== idToDelete);
+    setSlices(remaining);
+    
+    // Clear from auto-slices cache to prevent reappearing
+    allTimeAutoSlicesRef.current = allTimeAutoSlicesRef.current.filter((s) => s.id !== idToDelete);
+    
+    if (selectedSliceId === idToDelete) {
+      setSelectedSliceId(remaining.length > 0 ? remaining[0].id : null);
+    }
+  };
+
+  /**
    * Removes the selected slice.
    */
   const deleteSelectedSlice = () => {
-    if (!selectedSliceId) return;
-    const remaining = slices.filter((s) => s.id !== selectedSliceId);
-    setSlices(remaining);
-    setSelectedSliceId(remaining.length > 0 ? remaining[0].id : null);
+    if (selectedSliceId) {
+      deleteSliceById(selectedSliceId);
+    }
   };
 
   /**
@@ -1599,7 +1820,7 @@ export default function Workspace({
               backgroundPosition: "0 0, 0 12px, 12px -12px, -12px 0px",
               backgroundColor: "#ffffff",
             }}
-            className={`object-contain rounded-lg shadow-2xl border border-neutral-800 ${
+            className={`object-contain shadow-2xl border border-neutral-800 ${
               zoom > 1 ? "" : "max-w-full max-h-[480px]"
             }`}
           />
@@ -1677,7 +1898,7 @@ export default function Workspace({
                       processedImageDataRef.current,
                       x,
                       y,
-                      80,
+                      1,
                       padding,
                     );
                     if (rect) {
@@ -1869,562 +2090,588 @@ export default function Workspace({
         id="controls-sidebar"
         className="w-full lg:w-[380px] flex flex-col gap-5"
       >
-        {/* Navigation Mode Bar */}
-        <div className="bg-white border border-neutral-100 rounded-xl p-1 flex shadow-sm gap-1">
+        {/* Step-by-Step Workflow Tabs */}
+        <div className="bg-white border border-neutral-100 rounded-2xl p-1 flex shadow-sm gap-1">
           <button
-            id="tab-mode-chroma"
-            onClick={() => {
-              setWorkspaceMode("chroma");
-              setBrushMode("none");
-            }}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-lg font-semibold text-xs transition-all ${
-              workspaceMode === "chroma"
+            id="tab-step-bg"
+            onClick={() => setActiveStep("bg")}
+            className={`flex-1 flex flex-col items-center justify-center gap-1 py-2 px-1.5 rounded-xl font-bold text-[10px] sm:text-xs transition-all ${
+              activeStep === "bg"
                 ? "bg-neutral-900 text-white shadow-sm"
                 : "text-neutral-500 hover:text-neutral-800 hover:bg-neutral-50"
             }`}
           >
-            <Wand2 className="w-3.5 h-3.5" />
-            Фон
+            <Wand2 className="w-4 h-4" />
+            <span>1. Фон</span>
           </button>
           <button
-            id="tab-mode-brush"
-            onClick={() => {
-              setWorkspaceMode("brush");
-              setBrushMode("erase");
-            }}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-lg font-semibold text-xs transition-all ${
-              workspaceMode === "brush"
+            id="tab-step-slice"
+            onClick={() => setActiveStep("slice")}
+            className={`flex-1 flex flex-col items-center justify-center gap-1 py-2 px-1.5 rounded-xl font-bold text-[10px] sm:text-xs transition-all ${
+              activeStep === "slice"
                 ? "bg-neutral-900 text-white shadow-sm"
                 : "text-neutral-500 hover:text-neutral-800 hover:bg-neutral-50"
             }`}
           >
-            <Eraser className="w-3.5 h-3.5" />
-            Кисть/Ластик
+            <Grid className="w-4 h-4" />
+            <span>2. Нарезка</span>
           </button>
           <button
-            id="tab-mode-slice"
-            onClick={() => {
-              setWorkspaceMode("slice");
-              setBrushMode("none");
-            }}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-lg font-semibold text-xs transition-all ${
-              workspaceMode === "slice"
+            id="tab-step-objects"
+            onClick={() => setActiveStep("objects")}
+            className={`flex-1 flex flex-col items-center justify-center gap-1 py-2 px-1.5 rounded-xl font-bold text-[10px] sm:text-xs transition-all ${
+              activeStep === "objects"
                 ? "bg-neutral-900 text-white shadow-sm"
                 : "text-neutral-500 hover:text-neutral-800 hover:bg-neutral-50"
             }`}
           >
-            <Grid className="w-3.5 h-3.5" />
-            Выделение
-          </button>
-          <button
-            id="tab-mode-smart"
-            onClick={() => {
-              setWorkspaceMode("smart");
-              setBrushMode("none");
-            }}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-lg font-semibold text-xs transition-all ${
-              workspaceMode === "smart"
-                ? "bg-neutral-900 text-white shadow-sm"
-                : "text-neutral-500 hover:text-neutral-800 hover:bg-neutral-50"
-            }`}
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            Умный клик
-          </button>
-        </div>
-
-        {/* Global Protection Controls (ALWAYS VISIBLE) */}
-        <div className="bg-gradient-to-r from-emerald-500/10 to-teal-500/10 border border-emerald-100 rounded-2xl p-4 shadow-sm flex flex-col gap-2.5">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0" />
-              <div className="flex flex-col">
-                <span className="text-xs font-extrabold text-neutral-800">
-                  Защита монет и алмазов
-                </span>
-                <span className="text-[9px] text-neutral-500 font-medium">
-                  {contiguousMode
-                    ? "ВКЛЮЧЕНА (Внутренние детали защищены)"
-                    : "ВЫКЛЮЧЕНА (Возможны дырки в деталях)"}
-                </span>
-              </div>
-            </div>
-            <button
-              id="btn-toggle-contiguous-mode-global"
-              onClick={() => setContiguousMode((prev) => !prev)}
-              type="button"
-              className={`w-11 h-6 flex items-center rounded-full p-1 transition-all shrink-0 cursor-pointer ${
-                contiguousMode
-                  ? "bg-emerald-500 justify-end"
-                  : "bg-neutral-200 justify-start"
-              }`}
-            >
-              <span className="w-4 h-4 rounded-full bg-white shadow-md transition-all" />
-            </button>
-          </div>
-          <p className="text-[10.5px] text-neutral-600 leading-normal">
-            При включении алгоритм удаляет только внешний фон. Если отключить,
-            цвет фона будет стерт и изнутри объектов (что может испортить блики
-            на монетах или алмазах).
-          </p>
-        </div>
-
-        {/* Tab Panel 4: Smart Selection */}
-        {workspaceMode === "smart" && (
-          <div
-            id="panel-smart"
-            className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4"
-          >
-            <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2 border-b border-neutral-100 pb-2.5">
-              <Sparkles className="w-4 h-4 text-violet-500" />
-              Умный выбор объектов кликом
-            </h4>
-
-            <div className="bg-violet-50/50 border border-violet-100 rounded-xl p-3.5 flex flex-col gap-2">
-              <span className="text-xs font-bold text-violet-800 flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 animate-pulse text-violet-600" />
-                Как это работает?
-              </span>
-              <p className="text-xs text-neutral-600 leading-relaxed">
-                Просто нажмите на любой объект на картинке слева. Алгоритм
-                автоматически распознает его форму по прозрачности и сразу
-                выделит аккуратной рамкой.
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-1 bg-neutral-50 p-3 rounded-xl border border-neutral-100 mt-1">
-              <div className="flex justify-between text-xs font-semibold text-neutral-700">
-                <span>Количество рамок:</span>
-                <span className="text-neutral-800 bg-neutral-200/60 rounded px-1.5 py-0.5 font-bold font-mono">
+            <div className="relative">
+              <SlidersHorizontal className="w-4 h-4" />
+              {slices.length > 0 && (
+                <span className="absolute -top-1.5 -right-2 bg-blue-500 text-white text-[8px] font-bold rounded-full w-3.5 h-3.5 flex items-center justify-center border border-white">
                   {slices.length}
                 </span>
-              </div>
-              {selectedSliceId && (
-                <div className="mt-2 pt-2 border-t border-neutral-200/60 flex items-center justify-between text-xs text-neutral-600">
-                  <span className="truncate max-w-[150px]">
-                    Выбран:{" "}
-                    <span className="font-semibold text-neutral-800">
-                      {slices.find((s) => s.id === selectedSliceId)?.label}
-                    </span>
-                  </span>
-                  <button
-                    id="btn-delete-smart-slice"
-                    onClick={deleteSelectedSlice}
-                    className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded-lg transition-all"
-                    title="Удалить рамку"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
               )}
             </div>
+            <span>3. Объекты</span>
+          </button>
+        </div>
 
-            <button
-              id="btn-clear-smart-slices"
-              onClick={clearAllSlices}
-              className="text-xs py-2 px-3 border border-red-100 hover:border-red-200 text-red-600 hover:bg-red-50/50 rounded-xl transition-all font-medium flex items-center justify-center gap-1.5"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              Удалить ВСЕ рамки
-            </button>
-          </div>
-        )}
-
-        {/* Tab Panel 1: Color Background Keying */}
-        {workspaceMode === "chroma" && (
-          <div
-            id="panel-chroma"
-            className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4"
-          >
-            <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2 border-b border-neutral-100 pb-2.5">
-              <Wand2 className="w-4 h-4 text-cyan-500" />
-              Удаление фона по цвету
-            </h4>
-
-            {/* Current picked color swatch */}
-            <div className="flex items-center justify-between p-3 bg-neutral-50 rounded-xl border border-neutral-100">
-              <span className="text-xs text-neutral-500 font-medium">
-                Ключевой цвет:
-              </span>
-              <div className="flex items-center gap-2">
-                {transparentColor ? (
-                  <>
-                    <div
-                      className="w-5 h-5 rounded-md border border-neutral-200 shadow-inner"
-                      style={{
-                        backgroundColor: `rgb(${transparentColor.r}, ${transparentColor.g}, ${transparentColor.b})`,
-                      }}
-                    />
-                    <span className="font-mono text-xs text-neutral-800 font-semibold uppercase">
-                      rgb({transparentColor.r}, {transparentColor.g},{" "}
-                      {transparentColor.b})
-                    </span>
-                  </>
-                ) : (
-                  <span className="text-xs text-neutral-400 italic">
-                    Не выбран
-                  </span>
-                )}
-              </div>
+        {/* Step 1: Background Cleanup */}
+        {activeStep === "bg" && (
+          <div className="flex flex-col gap-4">
+            {/* Sub-mode selector: Chroma Key vs Brush */}
+            <div className="bg-neutral-100/80 border border-neutral-200/50 rounded-xl p-1 flex gap-1">
+              <button
+                onClick={() => setBgSubMode("chroma")}
+                className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition-all ${
+                  bgSubMode === "chroma"
+                    ? "bg-white text-neutral-900 shadow-sm"
+                    : "text-neutral-500 hover:text-neutral-800"
+                }`}
+              >
+                🧹 Пипетка цвета
+              </button>
+              <button
+                onClick={() => setBgSubMode("brush")}
+                className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition-all ${
+                  bgSubMode === "brush"
+                    ? "bg-white text-neutral-900 shadow-sm"
+                    : "text-neutral-500 hover:text-neutral-800"
+                }`}
+              >
+                🖌️ Кисть / Ластик
+              </button>
             </div>
 
-            {/* Chroma tolerance slider */}
-            <div className="flex flex-col gap-1.5">
-              <div className="flex justify-between text-xs font-semibold text-neutral-700">
-                <span>Допуск по цвету (Чувствительность)</span>
-                <span className="text-neutral-500 font-mono">{tolerance}</span>
-              </div>
-              <input
-                id="input-tolerance"
-                type="range"
-                min="5"
-                max="150"
-                value={tolerance}
-                onChange={(e) => setTolerance(parseInt(e.target.value))}
-                className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
-              />
-              <p className="text-[10px] text-neutral-400 leading-normal">
-                Увеличьте значение, если фон удаляется не полностью (например,
-                есть градиент или тени), или уменьшите, если пропадают части
-                логотипа.
-              </p>
-            </div>
+            {bgSubMode === "chroma" ? (
+              /* Chroma Key Panel */
+              <div className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4">
+                <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2 border-b border-neutral-100 pb-2.5">
+                  <Wand2 className="w-4 h-4 text-cyan-500" />
+                  Удаление фона по цвету
+                </h4>
 
-            {/* Edge softness/feathering slider */}
-            <div className="flex flex-col gap-1.5 pb-2 border-b border-neutral-100">
-              <div className="flex justify-between text-xs font-semibold text-neutral-700">
-                <span>Мягкость краев (Сглаживание)</span>
-                <span className="text-neutral-500 font-mono">
-                  {edgeSoftness} px
-                </span>
-              </div>
-              <input
-                id="input-edge-softness"
-                type="range"
-                min="0"
-                max="30"
-                value={edgeSoftness}
-                onChange={(e) => setEdgeSoftness(parseInt(e.target.value))}
-                className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
-              />
-              <p className="text-[10px] text-neutral-400 leading-normal">
-                Позволяет размыть жесткую границу перехода, устраняя
-                ступенчатость (пиксельные кубики). При 0 краям возвращается
-                максимальная резкость.
-              </p>
-            </div>
-
-            {/* In-panel protection toggle for maximum discoverability */}
-            <div className="bg-emerald-50/50 border border-emerald-100/70 rounded-xl p-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span className="text-xs font-bold text-neutral-800">
-                    Защита монет и алмазов
+                {/* Current picked color swatch */}
+                <div className="flex items-center justify-between p-3 bg-neutral-50 rounded-xl border border-neutral-100">
+                  <span className="text-xs text-neutral-500 font-medium">
+                    Ключевой цвет:
                   </span>
-                </div>
-                <button
-                  id="btn-toggle-contiguous-mode-panel"
-                  onClick={() => setContiguousMode((prev) => !prev)}
-                  type="button"
-                  className={`w-9 h-5 flex items-center rounded-full p-0.5 transition-all shrink-0 cursor-pointer ${
-                    contiguousMode
-                      ? "bg-emerald-500 justify-end"
-                      : "bg-neutral-200 justify-start"
-                  }`}
-                >
-                  <span className="w-3.5 h-3.5 rounded-full bg-white shadow-sm transition-all" />
-                </button>
-              </div>
-              <p className="text-[10px] text-neutral-500 leading-normal">
-                {contiguousMode
-                  ? "✓ ВКЛЮЧЕНА. Стирается только ВНЕШНИЙ фон. Детали внутри монет/алмазов защищены."
-                  : "✗ ВЫКЛЮЧЕНА. Цвет фона сотрется и внутри объектов, если встретится похожий оттенок."}
-              </p>
-              {contiguousMode && (
-                <div className="border-t border-emerald-100/50 pt-2 flex flex-col gap-1.5 mt-1">
-                  <span className="text-[9px] text-emerald-700 font-medium leading-relaxed">
-                    💡 Кликните внутри замкнутых ушек ключей, колец или дырок,
-                    чтобы также очистить их от фона, не затрагивая алмазы!
-                  </span>
-                  {manualSeeds.length > 0 && (
-                    <div className="flex items-center justify-between bg-white/80 border border-emerald-100 px-2 py-1 rounded-lg">
-                      <span className="text-[10px] text-neutral-600 font-semibold">
-                        Ручных точек: {manualSeeds.length}
+                  <div className="flex items-center gap-2">
+                    {transparentColor ? (
+                      <>
+                        <div
+                          className="w-5 h-5 rounded-md border border-neutral-200 shadow-inner"
+                          style={{
+                            backgroundColor: `rgb(${transparentColor.r}, ${transparentColor.g}, ${transparentColor.b})`,
+                          }}
+                        />
+                        <span className="font-mono text-xs text-neutral-800 font-semibold uppercase">
+                          rgb({transparentColor.r}, {transparentColor.g},{" "}
+                          {transparentColor.b})
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-xs text-neutral-400 italic">
+                        Не выбран
                       </span>
-                      <button
-                        id="btn-clear-seeds"
-                        onClick={() => setManualSeeds([])}
-                        type="button"
-                        className="text-[9px] bg-neutral-50 hover:bg-red-50 hover:text-red-600 text-neutral-500 border border-neutral-200 hover:border-red-200 px-1.5 py-0.5 rounded transition-all font-bold cursor-pointer"
-                      >
-                        Сбросить
-                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Chroma tolerance slider */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex justify-between text-xs font-semibold text-neutral-700">
+                    <span>Допуск по цвету (Чувствительность)</span>
+                    <span className="text-neutral-500 font-mono">{tolerance}</span>
+                  </div>
+                  <input
+                    id="input-tolerance"
+                    type="range"
+                    min="5"
+                    max="150"
+                    value={tolerance}
+                    onChange={(e) => setTolerance(parseInt(e.target.value))}
+                    className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
+                  />
+                  <p className="text-[10px] text-neutral-400 leading-normal">
+                    Увеличьте значение, если фон удаляется не полностью (например,
+                    есть градиент или тени), или уменьшите, если пропадают части
+                    логотипа.
+                  </p>
+                </div>
+
+                {/* Edge softness/feathering slider */}
+                <div className="flex flex-col gap-1.5 pb-2 border-b border-neutral-100">
+                  <div className="flex justify-between text-xs font-semibold text-neutral-700">
+                    <span>Мягкость краев (Сглаживание)</span>
+                    <span className="text-neutral-500 font-mono">
+                      {edgeSoftness} px
+                    </span>
+                  </div>
+                  <input
+                    id="input-edge-softness"
+                    type="range"
+                    min="0"
+                    max="30"
+                    value={edgeSoftness}
+                    onChange={(e) => setEdgeSoftness(parseInt(e.target.value))}
+                    className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
+                  />
+                  <p className="text-[10px] text-neutral-400 leading-normal">
+                    Позволяет размыть жесткую границу перехода, устраняя
+                    ступенчатость (пиксельные кубики). При 0 краям возвращается
+                    максимальная резкость.
+                  </p>
+                </div>
+
+                {/* In-panel protection toggle for maximum discoverability */}
+                <div className="bg-emerald-50/50 border border-emerald-100/70 rounded-xl p-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span className="text-xs font-bold text-neutral-800">
+                        Защита монет и алмазов
+                      </span>
+                    </div>
+                    <button
+                      id="btn-toggle-contiguous-mode-panel"
+                      onClick={() => setContiguousMode((prev) => !prev)}
+                      type="button"
+                      className={`w-9 h-5 flex items-center rounded-full p-0.5 transition-all shrink-0 cursor-pointer ${
+                        contiguousMode
+                          ? "bg-emerald-500 justify-end"
+                          : "bg-neutral-200 justify-start"
+                      }`}
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full bg-white shadow-sm transition-all" />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 leading-normal">
+                    {contiguousMode
+                      ? "✓ ВКЛЮЧЕНА. Стирается только ВНЕШНИЙ фон. Детали внутри монет/алмазов защищены."
+                      : "✗ ВЫКЛЮЧЕНА. Цвет фона сотрется и внутри объектов, если встретится похожий оттенок."}
+                  </p>
+                  {contiguousMode && (
+                    <div className="border-t border-emerald-100/50 pt-2 flex flex-col gap-1.5 mt-1">
+                      <span className="text-[9px] text-emerald-700 font-medium leading-relaxed">
+                        💡 Кликните внутри замкнутых ушек ключей, колец или дырок,
+                        чтобы также очистить их от фона, не затрагивая алмазы!
+                      </span>
+                      {manualSeeds.length > 0 && (
+                        <div className="flex items-center justify-between bg-white/80 border border-emerald-100 px-2 py-1 rounded-lg">
+                          <span className="text-[10px] text-neutral-600 font-semibold">
+                            Ручных точек: {manualSeeds.length}
+                          </span>
+                          <button
+                            id="btn-clear-seeds"
+                            onClick={() => setManualSeeds([])}
+                            type="button"
+                            className="text-[9px] bg-neutral-50 hover:bg-red-50 hover:text-red-600 text-neutral-500 border border-neutral-200 hover:border-red-200 px-1.5 py-0.5 rounded transition-all font-bold cursor-pointer"
+                          >
+                            Сбросить
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
+
+                {/* Trigger auto bg button */}
+                <button
+                  id="btn-auto-bg"
+                  onClick={() => {
+                    if (originalImageDataRef.current) {
+                      const autoColor = detectBackgroundColor(originalImageDataRef.current);
+                      setTransparentColor(autoColor);
+                      setLastPickedCoords({ x: 0, y: 0 });
+                    }
+                  }}
+                  className="mt-2 text-xs py-2.5 px-3 border border-neutral-200 hover:border-neutral-300 text-neutral-600 rounded-xl transition-all font-semibold hover:bg-neutral-50/50 flex items-center justify-center gap-1.5 active:scale-95"
+                >
+                  Авто-определение из углов
+                </button>
+              </div>
+            ) : (
+              /* Brush Panel */
+              <div className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4">
+                <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2 border-b border-neutral-100 pb-2.5">
+                  <Eraser className="w-4 h-4 text-amber-500" />
+                  Точечное стирание / Восстановление
+                </h4>
+
+                {/* Brush Sub-Mode Selector */}
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    id="btn-brush-erase"
+                    onClick={() => setBrushMode("erase")}
+                    className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold transition-all border ${
+                      brushMode === "erase"
+                        ? "bg-amber-50 border-amber-200 text-amber-700 font-bold"
+                        : "bg-white border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                    }`}
+                  >
+                    <div className="w-2 h-2 rounded-full bg-amber-500"></div>
+                    Режим Ластика
+                  </button>
+                  <button
+                    id="btn-brush-restore"
+                    onClick={() => setBrushMode("restore")}
+                    className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold transition-all border ${
+                      brushMode === "restore"
+                        ? "bg-blue-50 border-blue-200 text-blue-700 font-bold"
+                        : "bg-white border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                    }`}
+                  >
+                    <div className="w-2 h-2 rounded-full bg-blue-500"></div>
+                    Восстановление
+                  </button>
+                </div>
+
+                {/* Brush size slider */}
+                <div className="flex flex-col gap-1.5 mt-1">
+                  <div className="flex justify-between text-xs font-semibold text-neutral-700">
+                    <span>Размер кисти</span>
+                    <span className="text-neutral-500 font-mono">
+                      {brushSize}px
+                    </span>
+                  </div>
+                  <input
+                    id="input-brush-size"
+                    type="range"
+                    min="5"
+                    max="100"
+                    value={brushSize}
+                    onChange={(e) => setBrushSize(parseInt(e.target.value))}
+                    className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
+                  />
+                </div>
+
+                {/* Action buttons inside Brush */}
+                <button
+                  id="btn-reset-mask"
+                  onClick={resetBrushMask}
+                  className="mt-1 text-xs py-2.5 px-3 border border-neutral-200 hover:border-neutral-300 text-neutral-600 rounded-xl transition-all font-semibold hover:bg-neutral-50/50 flex items-center justify-center gap-1.5 active:scale-95"
+                >
+                  <Undo className="w-3.5 h-3.5" />
+                  Сбросить изменения кисти
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Step 2: Object Slicing */}
+        {activeStep === "slice" && (
+          <div className="flex flex-col gap-4">
+            {/* Auto-detect slices toggle panel */}
+            <div className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4">
+              <div className="flex items-center justify-between border-b border-neutral-100 pb-2.5">
+                <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2">
+                  <SlidersHorizontal className="w-4 h-4 text-neutral-600" />
+                  Автоматическая нарезка
+                </h4>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <div className="relative">
+                    <input
+                      type="checkbox"
+                      className="sr-only"
+                      checked={autoDetectEnabled}
+                      onChange={(e) => setAutoDetectEnabled(e.target.checked)}
+                    />
+                    <div
+                      className={`block w-9 h-5 rounded-full transition-colors ${autoDetectEnabled ? "bg-indigo-500" : "bg-neutral-300"}`}
+                    ></div>
+                    <div
+                      className={`dot absolute left-1 top-1 bg-white w-3 h-3 rounded-full transition-transform ${autoDetectEnabled ? "transform translate-x-4" : ""}`}
+                    ></div>
+                  </div>
+                </label>
+              </div>
+
+              {autoDetectEnabled ? (
+                <div className="flex flex-col gap-4 animate-in fade-in duration-200">
+                  {/* Merge Distance slider */}
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex justify-between text-xs font-semibold text-neutral-700">
+                      <span>Дистанция объединения (Сцепка)</span>
+                      <span className="text-neutral-500 font-mono">
+                        {mergeDistance}px
+                      </span>
+                    </div>
+                    <input
+                      id="input-merge-dist"
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={mergeDistance}
+                      onChange={(e) => setMergeDistance(parseInt(e.target.value))}
+                      className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
+                    />
+                    <p className="text-[10px] text-neutral-400">
+                      Увеличьте, чтобы объединить буквы/детали в один логотип, или
+                      уменьшите, чтобы разрезать их на отдельные ассеты.
+                    </p>
+                  </div>
+
+                  {/* Padding slider */}
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex justify-between text-xs font-semibold text-neutral-700">
+                      <span>Отступы внутри рамок (Внутренний люфт)</span>
+                      <span className="text-neutral-500 font-mono">+{padding}px</span>
+                    </div>
+                    <input
+                      id="input-padding"
+                      type="range"
+                      min="0"
+                      max="30"
+                      value={padding}
+                      onChange={(e) => setPadding(parseInt(e.target.value))}
+                      className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
+                    />
+                  </div>
+
+                  {/* Minimum size filter */}
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex justify-between text-xs font-semibold text-neutral-700">
+                      <span>Минимальный размер объекта</span>
+                      <span className="text-neutral-500 font-mono">{minSize}px</span>
+                    </div>
+                    <input
+                      id="input-min-size"
+                      type="range"
+                      min="2"
+                      max="100"
+                      value={minSize}
+                      onChange={(e) => setMinSize(parseInt(e.target.value))}
+                      className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
+                    />
+                    <p className="text-[10px] text-neutral-400">
+                      Исключает мелкие соринки, шумы или пылинки на фоне из результатов
+                      нарезки.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-xs text-neutral-500 leading-relaxed">
+                  Автоматическая нарезка отключена. Вы можете выделять объекты вручную с помощью инструментов ниже.
+                </p>
               )}
             </div>
 
-            {/* Trigger auto bg button */}
-            <button
-              id="btn-auto-bg"
-              onClick={() => {
-                if (originalImageDataRef.current) {
-                  const autoColor = detectBackgroundColor(originalImageDataRef.current);
-                  setTransparentColor(autoColor);
-                  setLastPickedCoords({ x: 0, y: 0 });
-                }
-              }}
-              className="mt-2 text-xs py-2 px-3 border border-neutral-200 hover:border-neutral-300 text-neutral-600 rounded-xl transition-all font-medium hover:bg-neutral-50/50 flex items-center justify-center gap-1.5"
-            >
-              Авто-определение из углов
-            </button>
-          </div>
-        )}
+            {/* Manual tools panel */}
+            <div className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4">
+              <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2 border-b border-neutral-100 pb-2.5">
+                <Grid className="w-4 h-4 text-emerald-500" />
+                Ручные инструменты выделения
+              </h4>
 
-        {/* Tab Panel 2: Manual Paint/Brush Mask Restorations */}
-        {workspaceMode === "brush" && (
-          <div
-            id="panel-brush"
-            className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4"
-          >
-            <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2 border-b border-neutral-100 pb-2.5">
-              <Eraser className="w-4 h-4 text-amber-500" />
-              Точечное стирание / Восстановление
-            </h4>
-
-            {/* Brush Sub-Mode Selector */}
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                id="btn-brush-erase"
-                onClick={() => setBrushMode("erase")}
-                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold transition-all border ${
-                  brushMode === "erase"
-                    ? "bg-amber-50 border-amber-200 text-amber-700 font-bold"
-                    : "bg-white border-neutral-200 text-neutral-600 hover:bg-neutral-50"
-                }`}
-              >
-                <div className="w-2 h-2 rounded-full bg-amber-500"></div>
-                Режим Ластика
-              </button>
-              <button
-                id="btn-brush-restore"
-                onClick={() => setBrushMode("restore")}
-                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold transition-all border ${
-                  brushMode === "restore"
-                    ? "bg-blue-50 border-blue-200 text-blue-700 font-bold"
-                    : "bg-white border-neutral-200 text-neutral-600 hover:bg-neutral-50"
-                }`}
-              >
-                <div className="w-2 h-2 rounded-full bg-blue-500"></div>
-                Восстановление
-              </button>
-            </div>
-
-            {/* Brush size slider */}
-            <div className="flex flex-col gap-1.5 mt-1">
-              <div className="flex justify-between text-xs font-semibold text-neutral-700">
-                <span>Размер кисти</span>
-                <span className="text-neutral-500 font-mono">
-                  {brushSize}px
-                </span>
+              {/* Manual Sub-Mode Selector */}
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setSliceSubMode("manual")}
+                  className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold transition-all border ${
+                    sliceSubMode === "manual"
+                      ? "bg-emerald-50 border-emerald-200 text-emerald-700 font-bold"
+                      : "bg-white border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                  }`}
+                >
+                  <Grid className="w-3.5 h-3.5" />
+                  Рамка вручную
+                </button>
+                <button
+                  onClick={() => setSliceSubMode("smart")}
+                  className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold transition-all border ${
+                    sliceSubMode === "smart"
+                      ? "bg-violet-50 border-violet-200 text-violet-700 font-bold"
+                      : "bg-white border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                  }`}
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  Умный клик
+                </button>
               </div>
-              <input
-                id="input-brush-size"
-                type="range"
-                min="5"
-                max="100"
-                value={brushSize}
-                onChange={(e) => setBrushSize(parseInt(e.target.value))}
-                className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
-              />
-            </div>
 
-            {/* Action buttons inside Brush */}
-            <button
-              id="btn-reset-mask"
-              onClick={resetBrushMask}
-              className="mt-1 text-xs py-2 px-3 border border-neutral-200 hover:border-neutral-300 text-neutral-600 rounded-xl transition-all font-medium hover:bg-neutral-50/50 flex items-center justify-center gap-1.5"
-            >
-              <Undo className="w-3.5 h-3.5" />
-              Сбросить изменения кисти
-            </button>
+              {sliceSubMode === "manual" ? (
+                <div className="flex flex-col gap-3 animate-in fade-in duration-200">
+                  {/* Edge snapping toggle */}
+                  <div className="flex items-center justify-between p-3 bg-violet-50/50 border border-violet-100 rounded-xl">
+                    <div className="flex flex-col">
+                      <span className="text-xs font-bold text-neutral-800 flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-violet-600" />
+                        Притягивать к краям (Магнит)
+                      </span>
+                      <span className="text-[10px] text-neutral-500 leading-tight mt-0.5">
+                        Стянет рамку ровно по краям объекта внутри выделенной зоны.
+                      </span>
+                    </div>
+                    <button
+                      id="btn-toggle-snap"
+                      onClick={() => setSnapToEdges((prev) => !prev)}
+                      className={`w-10 h-6 flex items-center rounded-full p-1 transition-all ${
+                        snapToEdges
+                          ? "bg-violet-600 justify-end"
+                          : "bg-neutral-200 justify-start"
+                      }`}
+                    >
+                      <span className="w-4 h-4 rounded-full bg-white shadow-sm transition-all" />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-neutral-400 leading-normal">
+                    Зажмите палец или мышь на изображении и ведите в сторону, чтобы вручную создать рамку кадрирования.
+                  </p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3 animate-in fade-in duration-200">
+                  <div className="bg-violet-50/50 border border-violet-100 rounded-xl p-3.5 flex flex-col gap-2">
+                    <span className="text-xs font-bold text-violet-800 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 animate-pulse text-violet-600" />
+                      Как это работает?
+                    </span>
+                    <p className="text-xs text-neutral-600 leading-relaxed">
+                      Просто нажмите на любой объект на картинке слева. Алгоритм автоматически распознает его форму по прозрачности и выделит рамкой.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              <button
+                id="btn-clear-slices"
+                onClick={clearAllSlices}
+                className="text-xs py-2.5 px-3 border border-red-100 hover:border-red-200 text-red-600 hover:bg-red-50/50 rounded-xl transition-all font-semibold flex items-center justify-center gap-1.5 active:scale-95"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Удалить ВСЕ рамки
+              </button>
+            </div>
           </div>
         )}
 
-        {/* Tab Panel 3: Manual Slicing / Bounding Box controls */}
-        {workspaceMode === "slice" && (
-          <div
-            id="panel-slice"
-            className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4"
-          >
+        {/* Step 3: Objects List */}
+        {activeStep === "objects" && (
+          <div className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4">
             <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2 border-b border-neutral-100 pb-2.5">
-              <Grid className="w-4 h-4 text-emerald-500" />
-              Рамки кадрирования ассетов
+              <SlidersHorizontal className="w-4 h-4 text-neutral-600" />
+              Список выделенных объектов
             </h4>
 
             {/* Bounding Box Info / Active Slices List */}
             <div className="flex flex-col gap-1 bg-neutral-50 p-3 rounded-xl border border-neutral-100">
               <div className="flex justify-between text-xs font-semibold text-neutral-700">
-                <span>Выявлено объектов:</span>
+                <span>Всего объектов:</span>
                 <span className="text-neutral-800 bg-neutral-200/60 rounded px-1.5 py-0.5 font-bold font-mono">
                   {slices.length}
                 </span>
               </div>
-              {selectedSliceId && (
-                <div className="mt-2 pt-2 border-t border-neutral-200/60 flex items-center justify-between text-xs text-neutral-600">
-                  <span className="truncate max-w-[150px]">
-                    Выбран:{" "}
-                    <span className="font-semibold text-neutral-800">
-                      {slices.find((s) => s.id === selectedSliceId)?.label}
-                    </span>
-                  </span>
-                  <button
-                    id="btn-delete-slice"
-                    onClick={deleteSelectedSlice}
-                    className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded-lg transition-all"
-                    title="Удалить рамку"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+            </div>
+
+            {slices.length > 0 ? (
+              <div className="flex flex-col gap-3">
+                {/* Scrollable list of slices */}
+                <div className="max-h-[200px] overflow-y-auto border border-neutral-100 rounded-xl p-2 flex flex-col gap-1 bg-neutral-50/50">
+                  {slices.map((slice) => {
+                    const isSelected = slice.id === selectedSliceId;
+                    return (
+                      <div
+                        key={slice.id}
+                        onClick={() => setSelectedSliceId(slice.id)}
+                        className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition-all text-xs ${
+                          isSelected
+                            ? "bg-neutral-900 text-white font-bold shadow-sm"
+                            : "hover:bg-neutral-100 text-neutral-700"
+                        }`}
+                      >
+                        <span className="truncate max-w-[200px]">{slice.label}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteSliceById(slice.id);
+                          }}
+                          className={`p-1 rounded transition-all ${
+                            isSelected
+                              ? "text-red-400 hover:text-red-300 hover:bg-neutral-800"
+                              : "text-neutral-400 hover:text-red-600 hover:bg-red-50"
+                          }`}
+                          title="Удалить рамку"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
-              )}
-            </div>
 
-            {/* Edge snapping toggle */}
-            <div className="flex items-center justify-between p-3 bg-violet-50/50 border border-violet-100 rounded-xl">
-              <div className="flex flex-col">
-                <span className="text-xs font-bold text-neutral-800 flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-violet-600" />
-                  Притягивать к краям (Магнит)
-                </span>
-                <span className="text-[10px] text-neutral-500 leading-tight mt-0.5">
-                  Стянет рамку ровно по краям объекта внутри выделенной зоны.
-                </span>
+                {/* Selected slice editor */}
+                {selectedSliceId && (
+                  <div className="bg-neutral-50 border border-neutral-100 rounded-xl p-3.5 flex flex-col gap-2.5 animate-in fade-in duration-200">
+                    <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider">
+                      Редактирование объекта
+                    </span>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-semibold text-neutral-700">
+                        Название ассета
+                      </label>
+                      <input
+                        type="text"
+                        value={slices.find((s) => s.id === selectedSliceId)?.label || ""}
+                        onChange={(e) => {
+                          const newLabel = e.target.value;
+                          setSlices((prev) =>
+                            prev.map((s) =>
+                              s.id === selectedSliceId ? { ...s, label: newLabel } : s
+                            )
+                          );
+                        }}
+                        className="w-full px-3 py-2 border border-neutral-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-neutral-900 bg-white"
+                        placeholder="Например, coin_gold"
+                      />
+                    </div>
+                    <button
+                      onClick={deleteSelectedSlice}
+                      className="text-xs py-2 px-3 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg transition-all font-semibold flex items-center justify-center gap-1.5 active:scale-95"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Удалить этот объект
+                    </button>
+                  </div>
+                )}
               </div>
-              <button
-                id="btn-toggle-snap"
-                onClick={() => setSnapToEdges((prev) => !prev)}
-                className={`w-10 h-6 flex items-center rounded-full p-1 transition-all ${
-                  snapToEdges
-                    ? "bg-violet-600 justify-end"
-                    : "bg-neutral-200 justify-start"
-                }`}
-              >
-                <span className="w-4 h-4 rounded-full bg-white shadow-sm transition-all" />
-              </button>
-            </div>
-
-            <p className="text-[10px] text-neutral-400 leading-normal">
-              Если автоматическая нарезка пропустила какой-то логотип или
-              объединила разные объекты, вы можете нарисовать рамку вручную.
-              Зажмите палец на изображении и ведите в сторону.
-            </p>
+            ) : (
+              <p className="text-xs text-neutral-500 italic text-center py-4">
+                Нет выделенных объектов. Перейдите на шаг **2. Нарезка**, чтобы добавить их.
+              </p>
+            )}
 
             <button
               id="btn-clear-slices"
               onClick={clearAllSlices}
-              className="text-xs py-2 px-3 border border-red-100 hover:border-red-200 text-red-600 hover:bg-red-50/50 rounded-xl transition-all font-medium flex items-center justify-center gap-1.5"
+              className="text-xs py-2.5 px-3 border border-red-100 hover:border-red-200 text-red-600 hover:bg-red-50/50 rounded-xl transition-all font-semibold flex items-center justify-center gap-1.5 active:scale-95"
             >
               <Trash2 className="w-3.5 h-3.5" />
               Удалить ВСЕ рамки
             </button>
           </div>
         )}
-
-        {/* Global Slicing Configuration Sliders (Always Visible below panels for continuous adjustment) */}
-        <div
-          id="panel-autocut-config"
-          className="bg-white border border-neutral-100 rounded-2xl p-5 shadow-sm flex flex-col gap-4"
-        >
-          <div className="flex items-center justify-between border-b border-neutral-100 pb-2.5">
-            <h4 className="font-bold text-neutral-800 text-sm flex items-center gap-2">
-              <SlidersHorizontal className="w-4 h-4 text-neutral-600" />
-              Параметры авто-нарезки
-            </h4>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <span className="text-xs text-neutral-500 font-medium select-none">
-                Авто-рамки
-              </span>
-              <div className="relative">
-                <input
-                  type="checkbox"
-                  className="sr-only"
-                  checked={autoDetectEnabled}
-                  onChange={(e) => setAutoDetectEnabled(e.target.checked)}
-                />
-                <div
-                  className={`block w-8 h-5 rounded-full transition-colors ${autoDetectEnabled ? "bg-indigo-500" : "bg-neutral-300"}`}
-                ></div>
-                <div
-                  className={`dot absolute left-1 top-1 bg-white w-3 h-3 rounded-full transition-transform ${autoDetectEnabled ? "transform translate-x-3" : ""}`}
-                ></div>
-              </div>
-            </label>
-          </div>
-
-          {/* Merge Distance slider */}
-          <div className="flex flex-col gap-1.5">
-            <div className="flex justify-between text-xs font-semibold text-neutral-700">
-              <span>Дистанция объединения (Сцепка)</span>
-              <span className="text-neutral-500 font-mono">
-                {mergeDistance}px
-              </span>
-            </div>
-            <input
-              id="input-merge-dist"
-              type="range"
-              min="0"
-              max="100"
-              value={mergeDistance}
-              onChange={(e) => setMergeDistance(parseInt(e.target.value))}
-              className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
-            />
-            <p className="text-[10px] text-neutral-400">
-              Увеличьте, чтобы объединить буквы/детали в один логотип, или
-              уменьшите, чтобы разрезать их на отдельные ассеты.
-            </p>
-          </div>
-
-          {/* Padding slider */}
-          <div className="flex flex-col gap-1.5">
-            <div className="flex justify-between text-xs font-semibold text-neutral-700">
-              <span>Отступы внутри рамок (Внутренний люфт)</span>
-              <span className="text-neutral-500 font-mono">+{padding}px</span>
-            </div>
-            <input
-              id="input-padding"
-              type="range"
-              min="0"
-              max="30"
-              value={padding}
-              onChange={(e) => setPadding(parseInt(e.target.value))}
-              className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
-            />
-          </div>
-
-          {/* Minimum size filter */}
-          <div className="flex flex-col gap-1.5">
-            <div className="flex justify-between text-xs font-semibold text-neutral-700">
-              <span>Минимальный размер объекта</span>
-              <span className="text-neutral-500 font-mono">{minSize}px</span>
-            </div>
-            <input
-              id="input-min-size"
-              type="range"
-              min="2"
-              max="100"
-              value={minSize}
-              onChange={(e) => setMinSize(parseInt(e.target.value))}
-              className="w-full h-1.5 bg-neutral-100 rounded-lg appearance-none cursor-pointer accent-neutral-900"
-            />
-            <p className="text-[10px] text-neutral-400">
-              Исключает мелкие соринки, шумы или пылинки на фоне из результатов
-              нарезки.
-            </p>
-          </div>
-        </div>
       </div>
     </div>
   );

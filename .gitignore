@@ -1,8 +1,45 @@
+# Node.js
 node_modules/
-build/
 dist/
+build/
 coverage/
-.DS_Store
+.npm
 *.log
+
+# Environment variables
 .env*
 !.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Rust
+target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.toast
+.cache/
+.pytest_cache/
+
+# Android
+.gradle/
+local.properties
+**/build/
+Captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aar
+*.ap_

@@ -9,7 +9,7 @@ export function findConnectedComponentAt(
   imageData: ImageData,
   startX: number,
   startY: number,
-  alphaThreshold = 80,
+  alphaThreshold = 1,
   paddingAmount = 4
 ): Rect | null {
   const { width, height, data } = imageData;
@@ -28,26 +28,40 @@ export function findConnectedComponentAt(
     return data[idx + 3] >= alphaThreshold;
   };
 
-  // If the clicked pixel itself is transparent, try to find a nearby opaque pixel
+  // If the clicked pixel itself is transparent, try to find a nearby opaque pixel using Euclidean distance
   if (!isPixelOpaque(sx, sy)) {
-    let found = false;
-    const maxSearchRadius = 15;
-    // Spiral search
-    for (let r = 1; r <= maxSearchRadius && !found; r++) {
-      for (let dx = -r; dx <= r && !found; dx++) {
-        for (let dy = -r; dy <= r && !found; dy++) {
-          if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
-          const testX = sx + dx;
-          const testY = sy + dy;
+    const maxSearchRadius = 100;
+    let closestX = -1;
+    let closestY = -1;
+    let minDistanceSq = maxSearchRadius * maxSearchRadius + 1;
+
+    for (let dy = -maxSearchRadius; dy <= maxSearchRadius; dy++) {
+      if (dy * dy >= minDistanceSq) continue;
+      const testY = sy + dy;
+      if (testY < 0 || testY >= height) continue;
+
+      const maxDx = Math.floor(Math.sqrt(minDistanceSq - dy * dy));
+      for (let dx = -maxDx; dx <= maxDx; dx++) {
+        const testX = sx + dx;
+        if (testX < 0 || testX >= width) continue;
+
+        const distSq = dx * dx + dy * dy;
+        if (distSq < minDistanceSq) {
           if (isPixelOpaque(testX, testY)) {
-            sx = testX;
-            sy = testY;
-            found = true;
+            minDistanceSq = distSq;
+            closestX = testX;
+            closestY = testY;
           }
         }
       }
     }
-    if (!found) return null;
+
+    if (closestX !== -1 && closestY !== -1) {
+      sx = closestX;
+      sy = closestY;
+    } else {
+      return null;
+    }
   }
 
   // Connected component labeling using BFS (using head index for O(1) dequeue speed)
@@ -60,7 +74,7 @@ export function findConnectedComponentAt(
   let minY = sy;
   let maxY = sy;
 
-  const maxPixels = 200000;
+  const maxPixels = 5000000;
   let pixelCount = 0;
   let head = 0;
 
@@ -176,7 +190,8 @@ export function detectSlices(
   imageData: ImageData,
   minSizeThreshold = 10,
   mergeDistance = 12,
-  paddingAmount = 4
+  paddingAmount = 4,
+  alphaThreshold = 1
 ): Rect[] {
   const { width, height, data } = imageData;
   
@@ -195,7 +210,7 @@ export function detectSlices(
     for (let y = startY; y < endY; y++) {
       for (let x = startX; x < endX; x++) {
         const idx = (y * width + x) * 4;
-        if (data[idx + 3] > 80) { // Alpha threshold for being considered part of an object
+        if (data[idx + 3] >= alphaThreshold) { // Alpha threshold for being considered part of an object
           return true;
         }
       }
@@ -328,13 +343,13 @@ export function detectSlices(
     mergedBoxes = nextList;
   }
 
-  // Apply padding and bounds constraint
   return mergedBoxes.map(box => {
+    const trimmed = trimTransparentMargins(imageData, box, alphaThreshold);
     const pad = paddingAmount;
-    const x = Math.max(0, box.x - pad);
-    const y = Math.max(0, box.y - pad);
-    const w = Math.min(width - x, box.width + pad * 2);
-    const h = Math.min(height - y, box.height + pad * 2);
+    const x = Math.max(0, trimmed.x - pad);
+    const y = Math.max(0, trimmed.y - pad);
+    const w = Math.min(width - x, trimmed.width + pad * 2);
+    const h = Math.min(height - y, trimmed.height + pad * 2);
     return { x, y, width: w, height: h };
   });
 }
@@ -370,7 +385,11 @@ export function cropImageData(source: ImageData, rect: Rect): ImageData {
 /**
  * Trims empty transparent border pixels from an image region, returning a tighter crop bounding box.
  */
-export function trimTransparentMargins(imageData: ImageData, rect: Rect): Rect {
+export function trimTransparentMargins(
+  imageData: ImageData,
+  rect: Rect,
+  alphaThreshold = 1
+): Rect {
   const { width, height, data } = imageData;
   
   const startX = Math.max(0, rect.x);
@@ -387,7 +406,7 @@ export function trimTransparentMargins(imageData: ImageData, rect: Rect): Rect {
   for (let y = startY; y < endY; y++) {
     for (let x = startX; x < endX; x++) {
       const idx = (y * width + x) * 4;
-      if (data[idx + 3] > 20) { // If pixel is mostly opaque
+      if (data[idx + 3] >= alphaThreshold) { // If pixel has content (not transparent)
         hasContent = true;
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
@@ -495,6 +514,9 @@ export function traceContours(imageData: ImageData, alphaThreshold = 127): [numb
         let loopEnded = false;
         let iterLimit = width * height; // safety limit to prevent infinite loops
 
+        let secondX = -1;
+        let secondY = -1;
+
         while (!loopEnded && iterLimit-- > 0) {
           let foundNext = false;
           
@@ -505,6 +527,16 @@ export function traceContours(imageData: ImageData, alphaThreshold = 127): [numb
             const ny = cy + dirs[checkDir][1];
 
             if (isOpaque(nx, ny)) {
+              if (cx === x && cy === y && nx === secondX && ny === secondY) {
+                loopEnded = true;
+                break;
+              }
+
+              if (contour.length === 1) {
+                secondX = nx;
+                secondY = ny;
+              }
+
               cx = nx;
               cy = ny;
               contour.push([cx, cy]);
@@ -517,14 +549,13 @@ export function traceContours(imageData: ImageData, alphaThreshold = 127): [numb
             }
           }
 
-          if (!foundNext) {
-            // Isolate single pixel component
+          if (loopEnded) {
             break;
           }
 
-          // Check if we returned to the starting point
-          if (cx === x && cy === y) {
-            loopEnded = true;
+          if (!foundNext) {
+            // Isolate single pixel component
+            break;
           }
         }
 
@@ -697,435 +728,37 @@ export function generateEmbeddedSvg(width: number, height: number, pngDataUrl: s
 </svg>`;
 }
 
-/**
- * Applies smart edge decontamination and alpha mask erosion to eliminate white or light background fringes (halo).
- * Color decontamination replaces the RGB values of semi-transparent pixels with those of nearby fully opaque pixels,
- * while alpha erosion shrinks the transparent outline slightly to delete stubborn white edge artifacts.
- */
-export function applySmartEdgeCleanup(
-  imageData: ImageData, 
-  erodeAmount = 1, 
-  keyColor: { r: number; g: number; b: number } | null = null
-): ImageData {
-  const { width, height } = imageData;
-  const srcData = new Uint8ClampedArray(imageData.data);
-  const outData = imageData.data;
-
-  // Step 1: Smooth Alpha Erosion
-  if (erodeAmount > 0) {
+function boxBlurFloat(input: Float32Array, output: Float32Array, width: number, height: number) {
+  const temp = new Float32Array(width * height);
+  // Horizontal pass
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let sum = 0;
+      let count = 0;
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx;
+        if (nx >= 0 && nx < width) {
+          sum += input[y * width + nx];
+          count++;
+        }
+      }
+      temp[y * width + x] = sum / count;
+    }
+  }
+  // Vertical pass
+  for (let x = 0; x < width; x++) {
     for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const idx = (y * width + x) * 4;
-        const alpha = srcData[idx + 3];
-        if (alpha > 0) {
-          let nearTransparentCount = 0;
-          let totalChecked = 0;
-          
-          for (let dy = -erodeAmount; dy <= erodeAmount; dy++) {
-            for (let dx = -erodeAmount; dx <= erodeAmount; dx++) {
-              if (dx === 0 && dy === 0) continue;
-              const nx = x + dx;
-              const ny = y + dy;
-              totalChecked++;
-              if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                const nIdx = (ny * width + nx) * 4;
-                if (srcData[nIdx + 3] === 0) {
-                  nearTransparentCount++;
-                }
-              } else {
-                nearTransparentCount++;
-              }
-            }
-          }
-          
-          if (nearTransparentCount > 0) {
-            // Smoothly reduce alpha based on fraction of transparent neighbors
-            const ratio = 1 - (nearTransparentCount / totalChecked) * 0.7;
-            outData[idx + 3] = Math.max(0, Math.round(alpha * ratio));
-          }
+      let sum = 0;
+      let count = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = y + dy;
+        if (ny >= 0 && ny < height) {
+          sum += temp[ny * width + x];
+          count++;
         }
       }
+      output[y * width + x] = sum / count;
     }
   }
-
-  // Sync eroded alphas for color decontamination step
-  const erodedSrc = new Uint8ClampedArray(outData);
-
-  // Step 2: Intelligent Color Decontamination & Un-Blending
-  // Only applies to boundary pixels (close to transparent background) to protect interior translucency (like diamonds or gemstones)
-  const searchRadius = 4;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * 4;
-      const alpha = erodedSrc[idx + 3];
-
-      if (alpha > 0 && alpha < 240) {
-        // Look within a small radius to verify if this pixel is near the transparent border
-        let isNearBackground = false;
-        const boundaryRadius = 3;
-        for (let dy = -boundaryRadius; dy <= boundaryRadius; dy++) {
-          for (let dx = -boundaryRadius; dx <= boundaryRadius; dx++) {
-            const nx = x + dx;
-            const ny = y + dy;
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-              if (erodedSrc[(ny * width + nx) * 4 + 3] === 0) {
-                isNearBackground = true;
-                break;
-              }
-            } else {
-              isNearBackground = true;
-              break;
-            }
-          }
-          if (isNearBackground) break;
-        }
-
-        if (isNearBackground) {
-          // 1. Find nearest fully opaque neighbor color
-          let bestX = -1;
-          let bestY = -1;
-          let minDist = Infinity;
-
-          for (let dy = -searchRadius; dy <= searchRadius; dy++) {
-            for (let dx = -searchRadius; dx <= searchRadius; dx++) {
-              if (dx === 0 && dy === 0) continue;
-              const nx = x + dx;
-              const ny = y + dy;
-              if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                const nIdx = (ny * width + nx) * 4;
-                if (erodedSrc[nIdx + 3] >= 240) {
-                  const d = dx * dx + dy * dy;
-                  if (d < minDist) {
-                    minDist = d;
-                    bestX = nx;
-                    bestY = ny;
-                  }
-                }
-              }
-            }
-          }
-
-          let dcR = srcData[idx];
-          let dcG = srcData[idx + 1];
-          let dcB = srcData[idx + 2];
-
-          if (bestX !== -1) {
-            const bIdx = (bestY * width + bestX) * 4;
-            dcR = erodedSrc[bIdx];
-            dcG = erodedSrc[bIdx + 1];
-            dcB = erodedSrc[bIdx + 2];
-          }
-
-          // 2. Un-blend from background key color if specified
-          if (keyColor) {
-            const A = alpha / 255;
-            if (A > 0.1) {
-              // Mathematical un-blending formula: F = (C - (1 - A) * K) / A
-              const ubR = Math.max(0, Math.min(255, Math.round((srcData[idx] - (1 - A) * keyColor.r) / A)));
-              const ubG = Math.max(0, Math.min(255, Math.round((srcData[idx + 1] - (1 - A) * keyColor.g) / A)));
-              const ubB = Math.max(0, Math.min(255, Math.round((srcData[idx + 2] - (1 - A) * keyColor.b) / A)));
-
-              // Smoothly transition from un-blended color (high alpha) to nearby opaque color (low alpha)
-              const weightOfUnblend = Math.max(0, Math.min(1, (A - 0.15) / 0.7)); // 0 at A=0.15, 1 at A=0.85
-              outData[idx] = Math.round(ubR * weightOfUnblend + dcR * (1 - weightOfUnblend));
-              outData[idx + 1] = Math.round(ubG * weightOfUnblend + dcG * (1 - weightOfUnblend));
-              outData[idx + 2] = Math.round(ubB * weightOfUnblend + dcB * (1 - weightOfUnblend));
-            } else {
-              outData[idx] = dcR;
-              outData[idx + 1] = dcG;
-              outData[idx + 2] = dcB;
-            }
-          } else {
-            outData[idx] = dcR;
-            outData[idx + 1] = dcG;
-            outData[idx + 2] = dcB;
-          }
-        }
-      }
-    }
-  }
-
-  // Step 3: High-Quality Alpha Anti-Aliasing (Smoothing)
-  const tempAlphas = new Uint8ClampedArray(outData);
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const idx = (y * width + x) * 4;
-      const alpha = tempAlphas[idx + 3];
-      
-      // We only smooth pixels that are transition/edge pixels (semi-transparent or adjacent to transparent)
-      let isEdge = false;
-      if (alpha > 0 && alpha < 255) {
-        isEdge = true;
-      } else if (alpha === 255) {
-        // Check 4-neighborhood
-        if (tempAlphas[idx - 4 + 3] < 255 || 
-            tempAlphas[idx + 4 + 3] < 255 || 
-            tempAlphas[idx - width * 4 + 3] < 255 || 
-            tempAlphas[idx + width * 4 + 3] < 255) {
-          isEdge = true;
-        }
-      }
-      
-      if (isEdge) {
-        // Apply a gentle 3x3 weighted average to smooth the alpha channel
-        let alphaSum = 0;
-        let weightSum = 0;
-        
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const nIdx = ((y + dy) * width + (x + dx)) * 4;
-            const weight = (dx === 0 && dy === 0) ? 4 : 1;
-            alphaSum += tempAlphas[nIdx + 3] * weight;
-            weightSum += weight;
-          }
-        }
-        
-        outData[idx + 3] = Math.round(alphaSum / weightSum);
-      }
-    }
-  }
-
-  return imageData;
 }
 
-
-export async function applyAILocalEdgeRefinement(
-  originalData: ImageData,
-  processedData: ImageData,
-  transparentColor: { r: number; g: number; b: number } | null,
-  tolerance: number
-): Promise<ImageData> {
-  const width = originalData.width;
-  const height = originalData.height;
-
-  const resultData = new ImageData(
-    new Uint8ClampedArray(processedData.data),
-    width,
-    height,
-  );
-  const procData = resultData.data;
-  const rawOrigData = originalData.data;
-
-  // 3 passes: 2 for structural erosion of fringes, 1 for color decontamination
-  const passes = 3;
-  const searchRadius = 6; 
-
-  let minX = width, minY = height, maxX = 0, maxY = 0;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      if (procData[(y * width + x) * 4 + 3] > 0) {
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
-    }
-  }
-
-  if (minX > maxX) {
-    return resultData; // nothing to process
-  }
-
-  minX = Math.max(0, minX - searchRadius - 2);
-  maxX = Math.min(width - 1, maxX + searchRadius + 2);
-  minY = Math.max(0, minY - searchRadius - 2);
-  maxY = Math.min(height - 1, maxY + searchRadius + 2);
-
-  const isOrigBg = new Uint8Array(width * height);
-  if (transparentColor) {
-    const rKey = transparentColor.r;
-    const gKey = transparentColor.g;
-    const bKey = transparentColor.b;
-    const tolSqr = (tolerance + 30) * (tolerance + 30); 
-    for (let i = 0; i < width * height; i++) {
-      const a = rawOrigData[i * 4 + 3];
-      if (a === 0) {
-        isOrigBg[i] = 1;
-      } else {
-        const r = rawOrigData[i * 4];
-        const g = rawOrigData[i * 4 + 1];
-        const b = rawOrigData[i * 4 + 2];
-        const distSqr = (r - rKey) ** 2 + (g - gKey) ** 2 + (b - bKey) ** 2;
-        if (distSqr <= tolSqr) {
-          isOrigBg[i] = 1;
-        }
-      }
-    }
-  } else {
-    for (let i = 0; i < width * height; i++) {
-      if (rawOrigData[i * 4 + 3] < 128) {
-        isOrigBg[i] = 1;
-      }
-    }
-  }
-
-  for (let pass = 0; pass < passes; pass++) {
-    const toErase: number[] = [];
-    const toRecolor: { idx: number; r: number; g: number; b: number; a?: number }[] = [];
-
-    for (let y = minY; y <= maxY; y++) {
-      if (y % 50 === 0) {
-        await new Promise(r => setTimeout(r, 0));
-      }
-      for (let x = minX; x <= maxX; x++) {
-        const idx = y * width + x;
-        const currentAlpha = procData[idx * 4 + 3];
-
-        if (currentAlpha === 0) continue;
-
-        let isEdge = false;
-        let transparentNeighbors = 0;
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const nx = x + dx;
-            const ny = y + dy;
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-              if (procData[(ny * width + nx) * 4 + 3] < 128) {
-                isEdge = true;
-                transparentNeighbors++;
-              }
-            } else {
-              isEdge = true;
-              transparentNeighbors++;
-            }
-          }
-        }
-
-        if (isEdge || currentAlpha < 255) {
-          let nearOrigBg = false;
-          const checkRadius = 6; 
-          for (let dy = -checkRadius; dy <= checkRadius && !nearOrigBg; dy++) {
-            for (let dx = -checkRadius; dx <= checkRadius; dx++) {
-              const nx = x + dx;
-              const ny = y + dy;
-              if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                if (isOrigBg[ny * width + nx] === 1) {
-                  nearOrigBg = true;
-                  break;
-                }
-              }
-            }
-          }
-
-          const origR = rawOrigData[idx * 4];
-          const origG = rawOrigData[idx * 4 + 1];
-          const origB = rawOrigData[idx * 4 + 2];
-          
-          let isSolidForeground = false;
-          if (transparentColor) {
-            const limitVal = Math.max(160, tolerance + 80);
-            const limitSqr = limitVal * limitVal;
-            const distSqr = (origR - transparentColor.r) ** 2 + (origG - transparentColor.g) ** 2 + (origB - transparentColor.b) ** 2;
-            isSolidForeground = distSqr > limitSqr;
-          }
-
-          if (!nearOrigBg || (isSolidForeground && pass < passes - 1)) {
-            if (pass < passes - 1) continue;
-          }
-
-          let fgR = 0, fgG = 0, fgB = 0, fgWeight = 0;
-          let bgR = 0, bgG = 0, bgB = 0, bgWeight = 0;
-
-          for (let dy = -searchRadius; dy <= searchRadius; dy++) {
-            for (let dx = -searchRadius; dx <= searchRadius; dx++) {
-              const nx = x + dx;
-              const ny = y + dy;
-              if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                const nIdx = ny * width + nx;
-                const alpha = procData[nIdx * 4 + 3];
-                const r = rawOrigData[nIdx * 4];
-                const g = rawOrigData[nIdx * 4 + 1];
-                const b = rawOrigData[nIdx * 4 + 2];
-                
-                const distWeight = 1 / (1 + Math.sqrt(dx*dx + dy*dy));
-
-                if (alpha < 128) {
-                  let distToBgKeySqr = 0;
-                  if (transparentColor) {
-                    distToBgKeySqr = (r - transparentColor.r) ** 2 + (g - transparentColor.g) ** 2 + (b - transparentColor.b) ** 2;
-                  }
-                  
-                  if (!transparentColor || distToBgKeySqr < 14400) { 
-                    bgR += r * distWeight; bgG += g * distWeight; bgB += b * distWeight; bgWeight += distWeight;
-                  }
-                } else if (alpha > 200) {
-                  fgR += r * distWeight; fgG += g * distWeight; fgB += b * distWeight; fgWeight += distWeight;
-                }
-              }
-            }
-          }
-
-          if (bgWeight > 0 && fgWeight > 0) {
-            const bgMeanR = bgR / bgWeight;
-            const bgMeanG = bgG / bgWeight;
-            const bgMeanB = bgB / bgWeight;
-
-            const fgMeanR = fgR / fgWeight;
-            const fgMeanG = fgG / fgWeight;
-            const fgMeanB = fgB / fgWeight;
-
-            const r = rawOrigData[idx * 4];
-            const g = rawOrigData[idx * 4 + 1];
-            const b = rawOrigData[idx * 4 + 2];
-
-            const distBgSqr = (r - bgMeanR) ** 2 + (g - bgMeanG) ** 2 + (b - bgMeanB) ** 2;
-            const distFgSqr = (r - fgMeanR) ** 2 + (g - fgMeanG) ** 2 + (b - fgMeanB) ** 2;
-
-            if (pass < passes - 1) {
-              // Pass 0, 1: Structure Erosion (Conservative)
-              if (distBgSqr < distFgSqr * 0.3) {
-                toErase.push(idx);
-              } else if (transparentNeighbors >= 5 && distBgSqr < distFgSqr * 0.8) {
-                toErase.push(idx);
-              }
-            } else {
-              // Final Pass: Color Decontamination & Alpha Blending (Soft Edges)
-              const distBg = Math.sqrt(distBgSqr);
-              const distFg = Math.sqrt(distFgSqr);
-
-              if (distBg < distFg * 2.0 || transparentNeighbors > 0) {
-                let ratio = distBg / (distBg + distFg + 0.001);
-                ratio = Math.max(0, Math.min(1, (ratio - 0.2) * 1.5)); // Contrast enhancement
-
-                let newAlpha = Math.round(ratio * currentAlpha);
-                if (isSolidForeground && newAlpha < currentAlpha) {
-                  newAlpha = currentAlpha;
-                }
-
-                if (newAlpha > 0) {
-                  toRecolor.push({ idx, r: fgMeanR, g: fgMeanG, b: fgMeanB, a: newAlpha });
-                } else {
-                  toErase.push(idx);
-                }
-              }
-            }
-          } else if (pass < passes - 1 && fgWeight === 0 && bgWeight > 0) {
-             // Island of noise
-             toErase.push(idx);
-          }
-        }
-      }
-    }
-
-    for (const idx of toErase) {
-      procData[idx * 4 + 3] = 0; 
-    }
-
-    for (const rc of toRecolor) {
-      procData[rc.idx * 4] = rc.r;
-      procData[rc.idx * 4 + 1] = rc.g;
-      procData[rc.idx * 4 + 2] = rc.b;
-      if (rc.a !== undefined) {
-        procData[rc.idx * 4 + 3] = rc.a;
-      }
-    }
-
-    // Optimization: if no structure changes in pass 0, skip pass 1
-    if (toErase.length === 0 && pass < passes - 1) {
-       pass = passes - 2; 
-    }
-  }
-  
-  return resultData;
-}
