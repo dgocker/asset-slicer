@@ -96,10 +96,6 @@ class BackgroundRemovalPlugin : Plugin() {
     }
 
     private fun getNormalizedUrl(url: String): String {
-        val onnxIndex = url.indexOf(".onnx", ignoreCase = true)
-        if (onnxIndex != -1) {
-            return url.substring(0, onnxIndex + 5)
-        }
         return try {
             val parsed = URL(url)
             "${parsed.protocol}://${parsed.host}${parsed.path}"
@@ -376,12 +372,21 @@ class BackgroundRemovalPlugin : Plugin() {
                     byteBuffer.order(ByteOrder.nativeOrder())
                     val floatBuffer = byteBuffer.asFloatBuffer()
 
-                    val rScale = 1.0f / (255.0f * 0.229f)
-                    val rOffset = -0.485f / 0.229f
-                    val gScale = 1.0f / (255.0f * 0.224f)
-                    val gOffset = -0.456f / 0.224f
-                    val bScale = 1.0f / (255.0f * 0.225f)
-                    val bOffset = -0.406f / 0.225f
+                    // Detect model type for correct normalization
+                    val modelName = (modelUrl ?: modelFile.name).lowercase()
+                    val isSimpleNorm = modelName.contains("rmbg") || modelName.contains("bria")
+                    val rScale: Float; val rOffset: Float
+                    val gScale: Float; val gOffset: Float
+                    val bScale: Float; val bOffset: Float
+                    if (isSimpleNorm) {
+                        rScale = 1.0f / (255.0f * 0.5f); rOffset = -1.0f
+                        gScale = 1.0f / (255.0f * 0.5f); gOffset = -1.0f
+                        bScale = 1.0f / (255.0f * 0.5f); bOffset = -1.0f
+                    } else {
+                        rScale = 1.0f / (255.0f * 0.229f); rOffset = -0.485f / 0.229f
+                        gScale = 1.0f / (255.0f * 0.224f); gOffset = -0.456f / 0.224f
+                        bScale = 1.0f / (255.0f * 0.225f); bOffset = -0.406f / 0.225f
+                    }
 
                     val totalPixels = targetSize * targetSize
                     val inputData = FloatArray(3 * totalPixels)
@@ -423,21 +428,30 @@ class BackgroundRemovalPlugin : Plugin() {
 
                         val outputTensor = runResults.get(0) as OnnxTensor
                         val outShape = outputTensor.info.shape
-                        if (outShape.size >= 2) {
-                            val dims = outShape.filter { it > 1 }
-                            if (dims.size >= 2) {
-                                outH = dims[0].toInt()
-                                outW = dims[1].toInt()
-                            } else if (dims.size == 1) {
-                                outH = dims[0].toInt()
-                                outW = dims[0].toInt()
-                            } else {
-                                outH = outShape[outShape.size - 2].toInt()
-                                outW = outShape[outShape.size - 1].toInt()
+                        when (outShape.size) {
+                            4 -> {
+                                if (outShape[3] == 1L && outShape[1] > 1L) {
+                                    // NHWC: [batch, height, width, channels]
+                                    outH = outShape[1].toInt()
+                                    outW = outShape[2].toInt()
+                                } else {
+                                    // NCHW: [batch, channels, height, width]
+                                    outH = outShape[2].toInt()
+                                    outW = outShape[3].toInt()
+                                }
                             }
-                        } else {
-                            outH = targetSize
-                            outW = targetSize
+                            3 -> {
+                                outH = outShape[1].toInt()
+                                outW = outShape[2].toInt()
+                            }
+                            2 -> {
+                                outH = outShape[0].toInt()
+                                outW = outShape[1].toInt()
+                            }
+                            else -> {
+                                outH = targetSize
+                                outW = targetSize
+                            }
                         }
 
                         val outBuffer = outputTensor.floatBuffer
@@ -463,7 +477,7 @@ class BackgroundRemovalPlugin : Plugin() {
                 var isAlreadyNormalized = true
                 for (i in 0 until outW * outH) {
                     val value = finalOutputData[i]
-                    if (value < 0.0f || value > 1.0f) {
+                    if (value < -0.05f || value > 1.05f) {
                         isAlreadyNormalized = false
                         break
                     }
@@ -506,7 +520,7 @@ class BackgroundRemovalPlugin : Plugin() {
                 val rHigh = 6.0f + 0.001f * L
                 val radiusSub = maxOf(2, Math.round(rHigh * gMax.toFloat() / L.toFloat()))
                 val scaleFactor = gMax.toFloat() / L.toFloat()
-                val epsilon = (1e-4f * scaleFactor * scaleFactor).coerceAtLeast(1e-6f)
+                val epsilon = 1e-4f
 
                 outputBitmap = GuidedFilterRefinement.refineMask(
                     originalBitmap = originalBitmap,
@@ -516,6 +530,9 @@ class BackgroundRemovalPlugin : Plugin() {
                     radius = radiusSub,
                     epsilon = epsilon
                 )
+
+                // Edge cleanup: erosion → AA → color decontamination
+                EdgeCleanup.apply(outputBitmap)
 
                 val outputFile = File(context.cacheDir, "removed_bg_${System.currentTimeMillis()}.png")
                 FileOutputStream(outputFile).use { outStream ->
@@ -879,5 +896,92 @@ object GuidedFilterRefinement {
                 output[y * width + x] = sum / windowSize
             }
         }
+    }
+}
+
+/**
+ * Post-processing edge cleanup for background-removed images.
+ * Fixes: white/black halos, contaminated edge colors, jagged semi-transparent fringes.
+ *
+ * Pipeline: Smooth Alpha Erosion → Alpha Anti-Aliasing → Color Decontamination
+ * Order matters: AA runs before decontamination so newly semi-transparent pixels get cleaned.
+ */
+object EdgeCleanup {
+
+    fun apply(bitmap: Bitmap) {
+        val w = bitmap.width
+        val h = bitmap.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        val alpha = IntArray(w * h) { (pixels[it] ushr 24) and 0xFF }
+
+        // Step 1: Smooth Alpha Erosion — only thick edges; thin structures (hair/wires) are preserved
+        val erodedAlpha = IntArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val i = y * w + x
+                val a = alpha[i]
+                if (a == 0) { erodedAlpha[i] = 0; continue }
+                var nearT = 0; var total = 0
+                for (dy in -1..1) { for (dx in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    val nx = x + dx; val ny = y + dy
+                    if (nx in 0 until w && ny in 0 until h) {
+                        total++
+                        if (alpha[ny * w + nx] == 0) nearT++
+                    }
+                }}
+                val opaqueCount = total - nearT
+                erodedAlpha[i] = if (nearT > 0 && opaqueCount >= 3) {
+                    (a * (1.0f - nearT.toFloat() / total.toFloat() * 0.5f)).toInt().coerceIn(0, 255)
+                } else a
+            }
+        }
+
+        // Step 2: Alpha Anti-Aliasing — smooth jagged edges
+        val aaAlpha = erodedAlpha.copyOf()
+        for (y in 1 until h - 1) { for (x in 1 until w - 1) {
+            val i = y * w + x; val a = erodedAlpha[i]
+            var isEdge = a in 1..254
+            if (!isEdge && a == 255) {
+                isEdge = erodedAlpha[i-1] < 255 || erodedAlpha[i+1] < 255 ||
+                        erodedAlpha[i-w] < 255 || erodedAlpha[i+w] < 255
+            }
+            if (!isEdge) continue
+            var s = 0; var wt = 0
+            for (dy in -1..1) { for (dx in -1..1) {
+                val cw = if (dx == 0 && dy == 0) 4 else 1
+                s += erodedAlpha[(y+dy)*w+(x+dx)] * cw; wt += cw
+            }}
+            aaAlpha[i] = (s.toFloat() / wt.toFloat()).toInt().coerceAtMost(a).coerceIn(0, 255)
+        }}
+
+        for (i in 0 until w * h) pixels[i] = (aaAlpha[i] shl 24) or (pixels[i] and 0x00FFFFFF)
+
+        // Step 3: Color Decontamination — replace background color bleed on semi-transparent edges
+        val snap = pixels.copyOf()
+        for (y in 0 until h) { for (x in 0 until w) {
+            val i = y * w + x; val a = aaAlpha[i]
+            if (a <= 0 || a >= 240) continue
+            var nearBg = false
+            run outer@{ for (dy in -3..3) { for (dx in -3..3) {
+                val nx = x+dx; val ny = y+dy
+                if (nx in 0 until w && ny in 0 until h && aaAlpha[ny*w+nx] == 0) { nearBg = true; return@outer }
+            }}}
+            if (!nearBg) continue
+            var bestD = Int.MAX_VALUE; var bestI = -1
+            for (dy in -5..5) { for (dx in -5..5) {
+                if (dx == 0 && dy == 0) continue
+                val nx = x+dx; val ny = y+dy
+                if (nx in 0 until w && ny in 0 until h && aaAlpha[ny*w+nx] >= 240) {
+                    val d = dx*dx + dy*dy
+                    if (d < bestD) { bestD = d; bestI = ny*w+nx }
+                }
+            }}
+            if (bestI != -1) pixels[i] = (a shl 24) or (snap[bestI] and 0x00FFFFFF)
+        }}
+
+        bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
     }
 }

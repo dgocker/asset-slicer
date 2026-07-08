@@ -570,16 +570,16 @@ export default function Workspace({
           aiImg.onload = () => {
             if (!active) return;
             const aiCanvas = document.createElement("canvas");
-            aiCanvas.width = aiImg!.naturalWidth;
-            aiCanvas.height = aiImg!.naturalHeight;
+            aiCanvas.width = img.naturalWidth;
+            aiCanvas.height = img.naturalHeight;
             const aiCtx = aiCanvas.getContext("2d");
             if (aiCtx) {
-              aiCtx.drawImage(aiImg!, 0, 0);
+              aiCtx.drawImage(aiImg!, 0, 0, img.naturalWidth, img.naturalHeight);
               const aiImgData = aiCtx.getImageData(
                 0,
                 0,
-                aiImg!.naturalWidth,
-                aiImg!.naturalHeight,
+                img.naturalWidth,
+                img.naturalHeight,
               );
 
               aiImageDataRef.current = aiImgData;
@@ -889,6 +889,12 @@ export default function Workspace({
       const pushPixel = (idx: number) => {
         if (isBackground[idx] === 0 && mask[idx] !== 1) {
           const pxIdx = idx * 4;
+          // Already transparent pixels (from AI removal) are passthrough for flood fill
+          if (data[pxIdx + 3] === 0) {
+            isBackground[idx] = 1;
+            queue[qTail++] = idx;
+            return;
+          }
           const dr = data[pxIdx] - keyColor.r;
           const dg = data[pxIdx + 1] - keyColor.g;
           const db = data[pxIdx + 2] - keyColor.b;
@@ -928,60 +934,80 @@ export default function Workspace({
         // Left
         if (cx > 0) {
           const nIdx = currIdx - 1;
-          if (isBackground[nIdx] === 0) {
+          if (isBackground[nIdx] === 0 && mask[nIdx] !== 1) {
             const nPxIdx = nIdx * 4;
-            const dr = data[nPxIdx] - keyColor.r;
-            const dg = data[nPxIdx + 1] - keyColor.g;
-            const db = data[nPxIdx + 2] - keyColor.b;
-            const distSqr = dr * dr + dg * dg + db * db;
-            if (distSqr <= propTolSqr) {
+            if (data[nPxIdx + 3] === 0) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
+            } else {
+              const dr = data[nPxIdx] - keyColor.r;
+              const dg = data[nPxIdx + 1] - keyColor.g;
+              const db = data[nPxIdx + 2] - keyColor.b;
+              const distSqr = dr * dr + dg * dg + db * db;
+              if (distSqr <= propTolSqr) {
+                isBackground[nIdx] = 1;
+                queue[qTail++] = nIdx;
+              }
             }
           }
         }
         // Right
         if (cx < width - 1) {
           const nIdx = currIdx + 1;
-          if (isBackground[nIdx] === 0) {
+          if (isBackground[nIdx] === 0 && mask[nIdx] !== 1) {
             const nPxIdx = nIdx * 4;
-            const dr = data[nPxIdx] - keyColor.r;
-            const dg = data[nPxIdx + 1] - keyColor.g;
-            const db = data[nPxIdx + 2] - keyColor.b;
-            const distSqr = dr * dr + dg * dg + db * db;
-            if (distSqr <= propTolSqr) {
+            if (data[nPxIdx + 3] === 0) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
+            } else {
+              const dr = data[nPxIdx] - keyColor.r;
+              const dg = data[nPxIdx + 1] - keyColor.g;
+              const db = data[nPxIdx + 2] - keyColor.b;
+              const distSqr = dr * dr + dg * dg + db * db;
+              if (distSqr <= propTolSqr) {
+                isBackground[nIdx] = 1;
+                queue[qTail++] = nIdx;
+              }
             }
           }
         }
         // Top
         if (cy > 0) {
           const nIdx = currIdx - width;
-          if (isBackground[nIdx] === 0) {
+          if (isBackground[nIdx] === 0 && mask[nIdx] !== 1) {
             const nPxIdx = nIdx * 4;
-            const dr = data[nPxIdx] - keyColor.r;
-            const dg = data[nPxIdx + 1] - keyColor.g;
-            const db = data[nPxIdx + 2] - keyColor.b;
-            const distSqr = dr * dr + dg * dg + db * db;
-            if (distSqr <= propTolSqr) {
+            if (data[nPxIdx + 3] === 0) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
+            } else {
+              const dr = data[nPxIdx] - keyColor.r;
+              const dg = data[nPxIdx + 1] - keyColor.g;
+              const db = data[nPxIdx + 2] - keyColor.b;
+              const distSqr = dr * dr + dg * dg + db * db;
+              if (distSqr <= propTolSqr) {
+                isBackground[nIdx] = 1;
+                queue[qTail++] = nIdx;
+              }
             }
           }
         }
         // Bottom
         if (cy < height - 1) {
           const nIdx = currIdx + width;
-          if (isBackground[nIdx] === 0) {
+          if (isBackground[nIdx] === 0 && mask[nIdx] !== 1) {
             const nPxIdx = nIdx * 4;
-            const dr = data[nPxIdx] - keyColor.r;
-            const dg = data[nPxIdx + 1] - keyColor.g;
-            const db = data[nPxIdx + 2] - keyColor.b;
-            const distSqr = dr * dr + dg * dg + db * db;
-            if (distSqr <= propTolSqr) {
+            if (data[nPxIdx + 3] === 0) {
               isBackground[nIdx] = 1;
               queue[qTail++] = nIdx;
+            } else {
+              const dr = data[nPxIdx] - keyColor.r;
+              const dg = data[nPxIdx + 1] - keyColor.g;
+              const db = data[nPxIdx + 2] - keyColor.b;
+              const distSqr = dr * dr + dg * dg + db * db;
+              if (distSqr <= propTolSqr) {
+                isBackground[nIdx] = 1;
+                queue[qTail++] = nIdx;
+              }
             }
           }
         }
@@ -1001,10 +1027,10 @@ export default function Workspace({
         if (maskVal === 0) {
           data[i + 3] = 0;
         } else if (maskVal === 1) {
-          data[i] = src.data[i];
-          data[i + 1] = src.data[i + 1];
-          data[i + 2] = src.data[i + 2];
-          data[i + 3] = src.data[i + 3];
+          data[i] = baseData.data[i];
+          data[i + 1] = baseData.data[i + 1];
+          data[i + 2] = baseData.data[i + 2];
+          data[i + 3] = baseData.data[i + 3];
         } else {
           if (contiguous && isBackground[idx] === 0) {
             continue;
@@ -1034,10 +1060,10 @@ export default function Workspace({
         if (maskVal === 0) {
           data[i + 3] = 0;
         } else if (maskVal === 1) {
-          data[i] = src.data[i];
-          data[i + 1] = src.data[i + 1];
-          data[i + 2] = src.data[i + 2];
-          data[i + 3] = src.data[i + 3];
+          data[i] = baseData.data[i];
+          data[i + 1] = baseData.data[i + 1];
+          data[i + 2] = baseData.data[i + 2];
+          data[i + 3] = baseData.data[i + 3];
         }
       }
     }
@@ -1588,7 +1614,16 @@ export default function Workspace({
       if (drawRect && drawRect.width > 5 && drawRect.height > 5) {
         let finalRect = drawRect;
         if (snapToEdges && processedImageDataRef.current) {
-          finalRect = trimTransparentMargins(processedImageDataRef.current, drawRect);
+          const trimmed = trimTransparentMargins(processedImageDataRef.current, drawRect);
+          // Re-apply user padding around the snapped content
+          const imgW = processedImageDataRef.current.width;
+          const imgH = processedImageDataRef.current.height;
+          finalRect = {
+            x: Math.max(0, trimmed.x - padding),
+            y: Math.max(0, trimmed.y - padding),
+            width: Math.min(imgW, trimmed.x + trimmed.width + padding) - Math.max(0, trimmed.x - padding),
+            height: Math.min(imgH, trimmed.y + trimmed.height + padding) - Math.max(0, trimmed.y - padding),
+          };
         }
         // Add custom slice
         setSlices((prev) => {

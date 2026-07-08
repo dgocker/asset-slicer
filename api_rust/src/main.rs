@@ -68,7 +68,7 @@ fn apply_smart_edge_cleanup(mut img: RgbaImage, erode_amount: i32) -> RgbaImage 
     let (width, height) = img.dimensions();
     let width = width as i32;
     let height = height as i32;
-    
+
     // Step 1: Smooth Alpha Erosion
     if erode_amount > 0 {
         let mut out_img = img.clone();
@@ -88,15 +88,14 @@ fn apply_smart_edge_cleanup(mut img: RgbaImage, erode_amount: i32) -> RgbaImage 
                             let nx = x + dx;
                             let ny = y + dy;
                             total_checked += 1;
-                            
+
                             if nx >= 0 && nx < width && ny >= 0 && ny < height {
-                                let npixel = img.get_pixel(nx as u32, ny as u32);
-                                if npixel[3] == 0 {
+                                if img.get_pixel(nx as u32, ny as u32)[3] == 0 {
                                     near_transparent_count += 1;
                                 }
-                            } else {
-                                near_transparent_count += 1;
                             }
+                            // Out-of-bounds: treat as opaque (NOT transparent) to avoid
+                            // over-eroding objects that touch image edges
                         }
                     }
 
@@ -113,72 +112,7 @@ fn apply_smart_edge_cleanup(mut img: RgbaImage, erode_amount: i32) -> RgbaImage 
         img = out_img;
     }
 
-    let eroded_src = img.clone();
-
-    // Step 2: Intelligent Color Decontamination
-    let search_radius = 4;
-    for y in 0..height {
-        for x in 0..width {
-            let mut pixel = *eroded_src.get_pixel(x as u32, y as u32);
-            let alpha = pixel[3];
-
-            if alpha > 0 && alpha < 240 {
-                let mut is_near_bg = false;
-                let boundary_radius = 3;
-                
-                for dy in -boundary_radius..=boundary_radius {
-                    for dx in -boundary_radius..=boundary_radius {
-                        let nx = x + dx;
-                        let ny = y + dy;
-                        if nx >= 0 && nx < width && ny >= 0 && ny < height {
-                            if eroded_src.get_pixel(nx as u32, ny as u32)[3] == 0 {
-                                is_near_bg = true;
-                                break;
-                            }
-                        } else {
-                            is_near_bg = true;
-                            break;
-                        }
-                    }
-                    if is_near_bg { break; }
-                }
-
-                if is_near_bg {
-                    let mut best_x = -1;
-                    let mut best_y = -1;
-                    let mut min_dist = i32::MAX;
-
-                    for dy in -search_radius..=search_radius {
-                        for dx in -search_radius..=search_radius {
-                            if dx == 0 && dy == 0 { continue; }
-                            let nx = x + dx;
-                            let ny = y + dy;
-                            if nx >= 0 && nx < width && ny >= 0 && ny < height {
-                                if eroded_src.get_pixel(nx as u32, ny as u32)[3] >= 240 {
-                                    let d = dx * dx + dy * dy;
-                                    if d < min_dist {
-                                        min_dist = d;
-                                        best_x = nx;
-                                        best_y = ny;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if best_x != -1 {
-                        let best_pixel = eroded_src.get_pixel(best_x as u32, best_y as u32);
-                        pixel[0] = best_pixel[0];
-                        pixel[1] = best_pixel[1];
-                        pixel[2] = best_pixel[2];
-                        img.put_pixel(x as u32, y as u32, pixel);
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 3: High-Quality Alpha Anti-Aliasing (Smoothing)
+    // Step 2: Alpha Anti-Aliasing (BEFORE decontamination)
     let temp_alphas = img.clone();
     for y in 1..height - 1 {
         for x in 1..width - 1 {
@@ -210,10 +144,72 @@ fn apply_smart_edge_cleanup(mut img: RgbaImage, erode_amount: i32) -> RgbaImage 
                     }
                 }
 
-                let new_alpha = (alpha_sum as f32 / weight_sum as f32).round() as u8;
+                let smoothed = (alpha_sum as f32 / weight_sum as f32).round() as u8;
+                // Clamp: never increase alpha beyond original (prevents outward bleed)
+                let new_alpha = smoothed.min(alpha);
                 let mut p = *img.get_pixel(x as u32, y as u32);
                 p[3] = new_alpha;
                 img.put_pixel(x as u32, y as u32, p);
+            }
+        }
+    }
+
+    // Step 3: Color Decontamination (AFTER AA so newly semi-transparent pixels get cleaned too)
+    let src_snapshot = img.clone();
+    let search_radius: i32 = 5;
+    for y in 0..height {
+        for x in 0..width {
+            let alpha = src_snapshot.get_pixel(x as u32, y as u32)[3];
+
+            if alpha > 0 && alpha < 240 {
+                let mut is_near_bg = false;
+                let boundary_radius: i32 = 3;
+
+                'outer: for dy in -boundary_radius..=boundary_radius {
+                    for dx in -boundary_radius..=boundary_radius {
+                        let nx = x + dx;
+                        let ny = y + dy;
+                        if nx >= 0 && nx < width && ny >= 0 && ny < height {
+                            if src_snapshot.get_pixel(nx as u32, ny as u32)[3] == 0 {
+                                is_near_bg = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                if is_near_bg {
+                    let mut best_x: i32 = -1;
+                    let mut best_y: i32 = -1;
+                    let mut min_dist = i32::MAX;
+
+                    for dy in -search_radius..=search_radius {
+                        for dx in -search_radius..=search_radius {
+                            if dx == 0 && dy == 0 { continue; }
+                            let nx = x + dx;
+                            let ny = y + dy;
+                            if nx >= 0 && nx < width && ny >= 0 && ny < height {
+                                if src_snapshot.get_pixel(nx as u32, ny as u32)[3] >= 240 {
+                                    let d = dx * dx + dy * dy;
+                                    if d < min_dist {
+                                        min_dist = d;
+                                        best_x = nx;
+                                        best_y = ny;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if best_x != -1 {
+                        let best_pixel = src_snapshot.get_pixel(best_x as u32, best_y as u32);
+                        let mut p = *img.get_pixel(x as u32, y as u32);
+                        p[0] = best_pixel[0];
+                        p[1] = best_pixel[1];
+                        p[2] = best_pixel[2];
+                        img.put_pixel(x as u32, y as u32, p);
+                    }
+                }
             }
         }
     }

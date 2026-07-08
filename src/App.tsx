@@ -39,14 +39,14 @@ interface SavedModel {
 const DEFAULT_PRESETS: SavedModel[] = [
   {
     name: 'RMBG-1.4 (Bria AI)',
-    url: 'http://78.17.74.156:3000/model_quantized.onnx',
+    url: 'https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model.onnx',
     sizeLabel: '43 МБ',
     isPreset: true,
     description: 'Рекомендуется. Премиум качество, отлично определяет мелкие детали, волосы и сложные границы.'
   },
   {
     name: 'U2Netp (Lightweight)',
-    url: 'http://78.17.74.156:3000/u2netp.onnx',
+    url: 'https://huggingface.co/nicjac/u2netp-onnx/resolve/main/u2netp.onnx',
     sizeLabel: '4.4 МБ',
     isPreset: true,
     description: 'Суперлегкая модель. Мгновенно скачивается, работает быстро и потребляет минимум оперативной памяти.'
@@ -118,7 +118,7 @@ export default function App() {
     return localStorage.getItem('modelDownloadUrl') || (window.location.origin + '/assets/background-removal-data/');
   });
   const [customModelUrl, setCustomModelUrl] = useState<string>(() => {
-    return localStorage.getItem('customModelUrl') || 'http://78.17.74.156:3000/model_quantized.onnx';
+    return localStorage.getItem('customModelUrl') || 'https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model.onnx';
   });
   const [exportFolder, setExportFolder] = useState<string>(() => {
     return localStorage.getItem('exportFolder') || 'Download';
@@ -190,6 +190,8 @@ export default function App() {
     if (!useAIBgRemoval) {
       setImageSrc(dataUrl);
       setAssets({});
+      setIsAIRemoving(false);
+      setAiPercent(0);
       return;
     }
 
@@ -865,7 +867,7 @@ export default function App() {
                       </button>
                       <button
                         onClick={async () => {
-                          const url = 'http://78.17.74.156:3000/model_quantized.onnx';
+                          const url = DEFAULT_PRESETS[0].url;
                           setModelsList(DEFAULT_PRESETS);
                           localStorage.setItem('user_models_list', JSON.stringify(DEFAULT_PRESETS));
                           setCustomModelUrl(url);

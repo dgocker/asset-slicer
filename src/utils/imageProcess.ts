@@ -14,23 +14,30 @@ export function findConnectedComponentAt(
 ): Rect | null {
   const { width, height, data } = imageData;
 
-  // Round starting coordinates
   let sx = Math.round(startX);
   let sy = Math.round(startY);
 
-  // Ensure coordinates are within bounds
   if (sx < 0 || sx >= width || sy < 0 || sy >= height) return null;
 
-  // Helper to check if pixel is opaque
+  // Use a higher threshold for connectivity to avoid leaking through
+  // semi-transparent edge pixels between adjacent assets
+  const connectThreshold = Math.max(alphaThreshold, 20);
+
   const isPixelOpaque = (px: number, py: number): boolean => {
     if (px < 0 || px >= width || py < 0 || py >= height) return false;
     const idx = (py * width + px) * 4;
     return data[idx + 3] >= alphaThreshold;
   };
 
-  // If the clicked pixel itself is transparent, try to find a nearby opaque pixel using Euclidean distance
+  const isPixelConnected = (px: number, py: number): boolean => {
+    if (px < 0 || px >= width || py < 0 || py >= height) return false;
+    const idx = (py * width + px) * 4;
+    return data[idx + 3] >= connectThreshold;
+  };
+
+  // If clicked pixel is transparent, find nearest opaque pixel
   if (!isPixelOpaque(sx, sy)) {
-    const maxSearchRadius = 100;
+    const maxSearchRadius = 60;
     let closestX = -1;
     let closestY = -1;
     let minDistanceSq = maxSearchRadius * maxSearchRadius + 1;
@@ -47,7 +54,7 @@ export function findConnectedComponentAt(
 
         const distSq = dx * dx + dy * dy;
         if (distSq < minDistanceSq) {
-          if (isPixelOpaque(testX, testY)) {
+          if (isPixelConnected(testX, testY)) {
             minDistanceSq = distSq;
             closestX = testX;
             closestY = testY;
@@ -64,7 +71,7 @@ export function findConnectedComponentAt(
     }
   }
 
-  // Connected component labeling using BFS (using head index for O(1) dequeue speed)
+  // BFS flood fill using connectThreshold for traversal
   const visited = new Uint8Array(width * height);
   const queue: [number, number][] = [[sx, sy]];
   visited[sy * width + sx] = 1;
@@ -102,7 +109,7 @@ export function findConnectedComponentAt(
       const [nx, ny] = neighbors[i];
       if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
         const idx = ny * width + nx;
-        if (visited[idx] === 0 && isPixelOpaque(nx, ny)) {
+        if (visited[idx] === 0 && isPixelConnected(nx, ny)) {
           visited[idx] = 1;
           queue.push([nx, ny]);
         }
@@ -110,12 +117,18 @@ export function findConnectedComponentAt(
     }
   }
 
-  // Convert to Rect with bounding padding, clamping symmetrically
+  // Expand bounding box to include adjacent low-alpha pixels (the soft edge fringe)
+  const expandBy = 2;
+  minX = Math.max(0, minX - expandBy);
+  minY = Math.max(0, minY - expandBy);
+  maxX = Math.min(width - 1, maxX + expandBy);
+  maxY = Math.min(height - 1, maxY + expandBy);
+
   const rx = Math.max(0, minX - paddingAmount);
   const ry = Math.max(0, minY - paddingAmount);
   const rMaxX = Math.min(width - 1, maxX + paddingAmount);
   const rMaxY = Math.min(height - 1, maxY + paddingAmount);
-  
+
   const rw = rMaxX - rx + 1;
   const rh = rMaxY - ry + 1;
 
@@ -196,7 +209,10 @@ export function detectSlices(
   const { width, height, data } = imageData;
   
   // Downsample grid for scanning speed on mobile (prevents frame freezes on large camera files)
-  const step = Math.max(1, Math.floor(Math.min(width, height) / 250));
+  const step = Math.max(1, Math.min(
+    Math.floor(Math.min(width, height) / 250),
+    Math.max(1, Math.floor(minSizeThreshold / 3))
+  ));
   const gridW = Math.ceil(width / step);
   const gridH = Math.ceil(height / step);
 
