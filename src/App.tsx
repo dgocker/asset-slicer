@@ -321,6 +321,85 @@ function cleanColorFallbackMask(mask: Uint8Array, w: number, h: number): Uint8Ar
   return out;
 }
 
+/**
+ * Удаляет из результата «чужаков» — компоненты альфы, ВХОДЯЩИЕ в рамку снаружи
+ * (кусок соседнего объекта, перекрытого рамкой). Признак чужака: компонента
+ * касается края рамки в местах, где fg листа ПРОДОЛЖАЕТСЯ за границей (≥3 такие
+ * точки), и занимает <50% непрозрачного содержимого. Свой объект, даже касаясь
+ * края, снаружи не продолжается (или является главной массой кадра).
+ * Работает для ЛЮБОГО типа выделения: авто/ручного/прилипания/умного.
+ */
+function removeCutoffForeigners(
+  imgData: ImageData,
+  img: HTMLImageElement,
+  rect: Rect,
+  sheetBg: ColorRGB
+): void {
+  const w = imgData.width, h = imgData.height;
+  const data = imgData.data;
+  const mask = new Uint8Array(w * h);
+  let totalOpaque = 0;
+  for (let p = 0; p < w * h; p++) {
+    if (data[p * 4 + 3] > 8) { mask[p] = 1; totalOpaque++; }
+  }
+  if (totalOpaque === 0) return;
+
+  // fg-флаги листа СРАЗУ ЗА границей рамки (4 полосы по 1px)
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const sampleStrip = (sx: number, sy: number, sw: number, sh: number): Uint8Array => {
+    const len = Math.max(sw, sh);
+    const out = new Uint8Array(len);
+    if (sx < 0 || sy < 0 || sx + sw > W || sy + sh > H || sw < 1 || sh < 1) return out; // за листом = фон
+    const c = document.createElement('canvas');
+    c.width = sw; c.height = sh;
+    const cx = c.getContext('2d', { willReadFrequently: true });
+    if (!cx) return out;
+    cx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+    const d = cx.getImageData(0, 0, sw, sh).data;
+    for (let i = 0; i < len; i++) {
+      const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+      const diff = Math.max(Math.abs(r - sheetBg.r), Math.abs(g - sheetBg.g), Math.abs(b - sheetBg.b));
+      if (diff > 25) out[i] = 1;
+    }
+    return out;
+  };
+  const rx = Math.round(rect.x), ry = Math.round(rect.y);
+  const topOut = sampleStrip(rx, ry - 1, w, 1);
+  const bottomOut = sampleStrip(rx, ry + h, w, 1);
+  const leftOut = sampleStrip(rx - 1, ry, 1, h);
+  const rightOut = sampleStrip(rx + w, ry, 1, h);
+
+  const labels = new Int32Array(w * h);
+  const queue = new Int32Array(w * h);
+  let nLabels = 0;
+  for (let start = 0; start < w * h; start++) {
+    if (mask[start] !== 1 || labels[start] !== 0) continue;
+    nLabels++;
+    labels[start] = nLabels;
+    let qh = 0, qt = 0;
+    queue[qt++] = start;
+    let area = 0, outsideContacts = 0;
+    const compPixels: number[] = [];
+    while (qh < qt) {
+      const p = queue[qh++];
+      compPixels.push(p);
+      area++;
+      const px = p % w, py = (p / w) | 0;
+      if (py === 0 && topOut[px] === 1) outsideContacts++;
+      if (py === h - 1 && bottomOut[px] === 1) outsideContacts++;
+      if (px === 0 && leftOut[py] === 1) outsideContacts++;
+      if (px === w - 1 && rightOut[py] === 1) outsideContacts++;
+      if (px > 0 && mask[p - 1] === 1 && labels[p - 1] === 0) { labels[p - 1] = nLabels; queue[qt++] = p - 1; }
+      if (px < w - 1 && mask[p + 1] === 1 && labels[p + 1] === 0) { labels[p + 1] = nLabels; queue[qt++] = p + 1; }
+      if (py > 0 && mask[p - w] === 1 && labels[p - w] === 0) { labels[p - w] = nLabels; queue[qt++] = p - w; }
+      if (py < h - 1 && mask[p + w] === 1 && labels[p + w] === 0) { labels[p + w] = nLabels; queue[qt++] = p + w; }
+    }
+    if (outsideContacts >= 3 && area < 0.5 * totalOpaque) {
+      for (const p of compPixels) data[p * 4 + 3] = 0;
+    }
+  }
+}
+
 /** Площадь пересечения двух прямоугольников. */
 function rectIntersectionArea(a: Rect, b: Rect): number {
   const ix = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
@@ -864,13 +943,15 @@ export default function App() {
       canvas: HTMLCanvasElement,
       applySelfMask: boolean
     ) => {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) throw new Error('Canvas 2D context unavailable');
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       if (applySelfMask && dilatedSelfMask) {
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (!ctx) throw new Error('Canvas 2D context unavailable');
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         intersectAlphaWithMask(imgData, dilatedSelfMask);
-        ctx.putImageData(imgData, 0, 0);
       }
+      // Куски соседних объектов, вошедшие в рамку снаружи, — вон (любой режим)
+      removeCutoffForeigners(imgData, img, rect, sheetBg);
+      ctx.putImageData(imgData, 0, 0);
       return trimCanvasTransparent(canvas);
     };
 
@@ -982,6 +1063,7 @@ export default function App() {
     }
     if (hasFg) {
       intersectAlphaWithMask(colorData, fallbackMask);
+      removeCutoffForeigners(colorData, img, rect, sheetBg);
       colorCtx.putImageData(colorData, 0, 0);
       const colorResult = await trimCanvasTransparent(colorCanvas);
       if (colorResult) {
