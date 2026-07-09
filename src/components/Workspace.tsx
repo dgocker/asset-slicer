@@ -51,6 +51,12 @@ function useDebounce<T>(value: T, delay: number): T {
 interface WorkspaceProps {
   imageSrc: string;
   aiImageSrc?: string | null;
+  /**
+   * Готовые слайсы (например, рамки из экрана выбора объектов).
+   * Применяются один раз при загрузке изображения; id должны начинаться
+   * с "custom-" или "smart-", чтобы пережить фильтрацию авто-слайсов.
+   */
+  initialSlices?: Slice[] | null;
   onSlicesUpdated: (
     slices: Slice[],
     processedImageData: ImageData,
@@ -63,6 +69,7 @@ interface WorkspaceProps {
 export default function Workspace({
   imageSrc,
   aiImageSrc,
+  initialSlices,
   onSlicesUpdated,
   onReset,
 }: WorkspaceProps) {
@@ -517,6 +524,13 @@ export default function Workspace({
     }
   }, [isMagnifierActive]);
 
+  // Mirror initialSlices in a ref so the image-load effect reads the latest value
+  // without retriggering on prop identity changes
+  const initialSlicesRef = useRef<Slice[] | null | undefined>(initialSlices);
+  useEffect(() => {
+    initialSlicesRef.current = initialSlices;
+  }, [initialSlices]);
+
   // Load image on mount
   useEffect(() => {
     if (!imageSrc) return;
@@ -562,6 +576,14 @@ export default function Workspace({
         setTransparentColor(null);
         setLastPickedCoords({ x: 0, y: 0 });
         setManualSeeds([]);
+
+        // Apply pre-defined slices (from the object selection screen), if any
+        const preset = initialSlicesRef.current;
+        if (preset && preset.length > 0) {
+          setSlices(preset);
+          setSelectedSliceId(preset[0].id);
+          setActiveStep("objects");
+        }
 
         // If AI-cleaned image is provided, load it to initialize processedImageDataRef and aiImageDataRef
         if (aiImageSrc) {

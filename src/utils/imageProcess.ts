@@ -399,6 +399,115 @@ export function cropImageData(source: ImageData, rect: Rect): ImageData {
 }
 
 /**
+ * Removes fragments of neighboring objects from a rect crop.
+ * A connected component is foreign when it touches the crop border and continues
+ * in the source image beyond the rect (by more than `overhang` px) — meaning the
+ * rect sliced through an object that mostly lies outside it. Components that end
+ * at the border (the selected object under a tight/trimmed rect) are kept.
+ */
+export function removeForeignFragments(
+  cropped: ImageData,
+  source: ImageData,
+  rect: Rect,
+  alphaThreshold = 20,
+  overhang = 3
+): ImageData {
+  const { width: sw, height: sh, data: src } = source;
+  const rx0 = Math.max(0, rect.x);
+  const ry0 = Math.max(0, rect.y);
+  const rx1 = Math.min(sw - 1, rect.x + rect.width - 1);
+  const ry1 = Math.min(sh - 1, rect.y + rect.height - 1);
+  if (rx1 < rx0 || ry1 < ry0) return cropped;
+
+  // BFS is bounded to the rect grown by overhang+1 — cost stays local to the crop
+  const ex0 = Math.max(0, rx0 - overhang - 1);
+  const ey0 = Math.max(0, ry0 - overhang - 1);
+  const ex1 = Math.min(sw - 1, rx1 + overhang + 1);
+  const ey1 = Math.min(sh - 1, ry1 + overhang + 1);
+  const ew = ex1 - ex0 + 1;
+  const eh = ey1 - ey0 + 1;
+
+  const visited = new Uint8Array(ew * eh);
+  const stack: number[] = [];
+  const component: number[] = [];
+
+  const isOpaque = (x: number, y: number) => src[(y * sw + x) * 4 + 3] >= alphaThreshold;
+
+  // A deliberately cropped fragment of a large object is itself "escaping"; never
+  // erase a component that makes up the bulk of the crop's content.
+  let opaqueTotal = 0;
+  for (let y = ry0; y <= ry1; y++) {
+    for (let x = rx0; x <= rx1; x++) {
+      if (isOpaque(x, y)) opaqueTotal++;
+    }
+  }
+  if (opaqueTotal === 0) return cropped;
+
+  const collectBorderSeeds: [number, number][] = [];
+  for (let x = rx0; x <= rx1; x++) {
+    collectBorderSeeds.push([x, ry0], [x, ry1]);
+  }
+  for (let y = ry0 + 1; y < ry1; y++) {
+    collectBorderSeeds.push([rx0, y], [rx1, y]);
+  }
+
+  for (const [bx, by] of collectBorderSeeds) {
+    const seedIdx = (by - ey0) * ew + (bx - ex0);
+    if (visited[seedIdx] || !isOpaque(bx, by)) continue;
+
+    // Flood this component within the expanded window
+    component.length = 0;
+    stack.length = 0;
+    stack.push(seedIdx);
+    visited[seedIdx] = 1;
+    let escapes = false;
+
+    while (stack.length > 0) {
+      const idx = stack.pop()!;
+      component.push(idx);
+      const cx = (idx % ew) + ex0;
+      const cy = Math.floor(idx / ew) + ey0;
+      if (cx < rx0 - overhang || cx > rx1 + overhang || cy < ry0 - overhang || cy > ry1 + overhang) {
+        escapes = true; // reached beyond the tolerated overhang → object continues outside
+      }
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = cx + dx;
+          const ny = cy + dy;
+          if (nx < ex0 || nx > ex1 || ny < ey0 || ny > ey1) continue;
+          const nIdx = (ny - ey0) * ew + (nx - ex0);
+          if (!visited[nIdx] && isOpaque(nx, ny)) {
+            visited[nIdx] = 1;
+            stack.push(nIdx);
+          }
+        }
+      }
+    }
+
+    if (escapes) {
+      let inCrop = 0;
+      for (const idx of component) {
+        const cx = (idx % ew) + ex0;
+        const cy = Math.floor(idx / ew) + ey0;
+        if (cx >= rx0 && cx <= rx1 && cy >= ry0 && cy <= ry1) inCrop++;
+      }
+      if (inCrop >= opaqueTotal * 0.5) continue; // bulk of the crop — this is the subject
+
+      for (const idx of component) {
+        const cx = (idx % ew) + ex0;
+        const cy = Math.floor(idx / ew) + ey0;
+        if (cx < rx0 || cx > rx1 || cy < ry0 || cy > ry1) continue;
+        const px = cx - rect.x;
+        const py = cy - rect.y;
+        cropped.data[(py * cropped.width + px) * 4 + 3] = 0;
+      }
+    }
+  }
+  return cropped;
+}
+
+/**
  * Trims empty transparent border pixels from an image region, returning a tighter crop bounding box.
  */
 export function trimTransparentMargins(

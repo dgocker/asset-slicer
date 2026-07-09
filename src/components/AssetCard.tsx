@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { Download, Copy, Check, Sparkles, Image as ImageIcon, Palette, Loader2, SlidersHorizontal, X } from 'lucide-react';
 import { Slice, SVGMode, ProcessedAsset, ColorRGB } from '../types';
-import { generateSilhouetteSvg, generateColorLayersSvg, generateEmbeddedSvg, trimTransparentMargins, cropImageData } from '../utils/imageProcess';
+import { generateSilhouetteSvg, generateColorLayersSvg, generateEmbeddedSvg, trimTransparentMargins, cropImageData, removeForeignFragments } from '../utils/imageProcess';
 import { enqueueHeavyTask, yieldToMain, getNextTaskVersion } from '../utils/taskQueue';
 
 interface AssetCardProps {
@@ -28,6 +28,10 @@ export default React.memo(function AssetCard({
   const [svgMode, setSvgMode] = useState<SVGMode>('embedded');
   const [trimMargins, setTrimMargins] = useState(true);
   const [keepBackground, setKeepBackground] = useState(false);
+  // Удаление «чужих» фрагментов соседних объектов из рамки. Отключаемо:
+  // если пользователь намеренно нарезал крупный объект по частям, его фрагмент
+  // (<50% непрозрачных пикселей кропа) иначе молча стирался бы из экспорта.
+  const [removeFragments, setRemoveFragments] = useState(true);
   const [embedFormat, setEmbedFormat] = useState<'webp' | 'png'>('webp');
   const [embedQuality, setEmbedQuality] = useState(80);
   const [previewBackground, setPreviewBackground] = useState<'checkerboard' | 'black' | 'white'>('checkerboard');
@@ -61,6 +65,9 @@ export default React.memo(function AssetCard({
 
     if (tightRect.width > 0 && tightRect.height > 0) {
       displayData = cropImageData(currentSource, tightRect);
+      if (!keepBackground && removeFragments) {
+        displayData = removeForeignFragments(displayData, currentSource, tightRect);
+      }
     } else {
       return;
     }
@@ -69,12 +76,12 @@ export default React.memo(function AssetCard({
     canvasRef.current.height = displayData.height;
     const ctx = canvasRef.current.getContext('2d');
     if (ctx) ctx.putImageData(displayData, 0, 0);
-  }, [slice, processedImageData, originalImageData, trimMargins, keepBackground]);
+  }, [slice, processedImageData, originalImageData, trimMargins, keepBackground, removeFragments]);
 
   const processAsset = useCallback(async () => {
     if (!processedImageData) return;
 
-    const settings = { trimMargins, embedFormat, embedQuality, svgMode, assetName, keyColor };
+    const settings = { trimMargins, removeFragments, embedFormat, embedQuality, svgMode, assetName, keyColor };
     const settingsChanged = JSON.stringify(settings) !== JSON.stringify(lastSettingsRef.current);
 
     // Fast check: if source identity and rect and settings are identical, return immediately.
@@ -133,6 +140,9 @@ export default React.memo(function AssetCard({
 
       if (tightRect.width <= 0 || tightRect.height <= 0) return { skipped: true, currentSlicePixels };
       displayData = cropImageData(currentSource, tightRect);
+      if (!keepBackground && removeFragments) {
+        displayData = removeForeignFragments(displayData, currentSource, tightRect);
+      }
 
       // 2. Data URLs
       const tempCanvas = document.createElement('canvas');
@@ -213,7 +223,7 @@ export default React.memo(function AssetCard({
     }
 
     setIsProcessing(false);
-  }, [slice, processedImageData, originalImageData, keyColor, trimMargins, keepBackground, embedFormat, embedQuality, svgMode, assetName, onAssetUpdated]);
+  }, [slice, processedImageData, originalImageData, keyColor, trimMargins, keepBackground, removeFragments, embedFormat, embedQuality, svgMode, assetName, onAssetUpdated]);
 
   useEffect(() => {
     // Debounce the entire process slightly more so it doesn't queue 100 tasks while dragging
@@ -346,6 +356,18 @@ export default React.memo(function AssetCard({
                 <span className="w-4 h-4 rounded-full bg-white shadow-sm transition-all" />
               </button>
             </div>
+
+            {!keepBackground && (
+              <div className="flex items-center justify-between p-2.5 bg-neutral-50 border border-neutral-100/85 rounded-xl">
+                <div className="flex flex-col gap-0.5 pr-2">
+                  <span className="text-xs font-bold text-neutral-800">Стирать чужие фрагменты</span>
+                  <p className="text-[10px] text-neutral-500 leading-normal">Удаляет куски соседних объектов, попавшие в рамку. Отключите, если объект намеренно нарезан по частям.</p>
+                </div>
+                <button onClick={() => setRemoveFragments(prev => !prev)} type="button" className={`w-10 h-6 flex items-center rounded-full p-1 transition-all shrink-0 ${removeFragments ? 'bg-neutral-900 justify-end' : 'bg-neutral-200 justify-start'}`}>
+                  <span className="w-4 h-4 rounded-full bg-white shadow-sm transition-all" />
+                </button>
+              </div>
+            )}
           </div>
 
           <div>

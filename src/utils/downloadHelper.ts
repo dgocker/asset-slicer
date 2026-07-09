@@ -67,8 +67,18 @@ export async function downloadTextFile(filename: string, content: string) {
  * Downloads/saves a binary file (from base64 or blob, like ZIP/PNG) to the device.
  * On Web: downloads via Blob URL or Data URL.
  * On Native (Android): saves to Documents/Download folder.
+ *
+ * options.silent — тихий режим для пакетного скачивания: не показывает alert
+ * об успехе на каждый файл; при полном провале записи бросает ошибку,
+ * чтобы вызывающий код показал один итоговый диалог.
  */
-export async function downloadBinaryFile(filename: string, base64Content: string, blobFallback?: Blob) {
+export async function downloadBinaryFile(
+  filename: string,
+  base64Content: string,
+  blobFallback?: Blob,
+  options?: { silent?: boolean }
+) {
+  const silent = !!options?.silent;
   if (Capacitor.isNativePlatform()) {
     try {
       try {
@@ -90,7 +100,9 @@ export async function downloadBinaryFile(filename: string, base64Content: string
         directory: Directory.Documents,
         recursive: true
       });
-      alert(`Файл успешно сохранен в Documents/${exportFolder}/${filename}`);
+      if (!silent) {
+        alert(`Файл успешно сохранен в Documents/${exportFolder}/${filename}`);
+      }
       console.log('Saved binary file successfully:', result.uri);
     } catch (e) {
       const exportFolder = localStorage.getItem('exportFolder') || 'Download';
@@ -103,8 +115,13 @@ export async function downloadBinaryFile(filename: string, base64Content: string
           directory: Directory.Documents,
           recursive: true
         });
-        alert(`Файл сохранен в корне Documents: ${filename}`);
+        if (!silent) {
+          alert(`Файл сохранен в корне Documents: ${filename}`);
+        }
       } catch (err2) {
+        if (silent) {
+          throw err2;
+        }
         alert('Ошибка при сохранении файла: ' + String(err2));
       }
     }
