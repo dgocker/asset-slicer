@@ -60,9 +60,6 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, '.'),
       },
     },
-    optimizeDeps: {
-      exclude: ['@imgly/background-removal']
-    },
     server: {
       proxy: {
         '/api': {

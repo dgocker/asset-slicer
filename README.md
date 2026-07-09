@@ -1,334 +1,90 @@
-# Remix: Asset Slicer & SVG Vectorizer
+# Asset Slicer — AI Asset Cutter
 
-Интуитивно понятный мобильно-ориентированный инструмент для нарезки графических листов (спрайтов, иконок, коллажей) на отдельные ассеты, автоматического или ручного удаления фона, точного кадрирования и преобразования растровой графики в масштабируемые векторные SVG-файлы.
+🇬🇧 English | [🇷🇺 Русский](README.ru.md)
 
-Приложение спроектировано для гибридного использования: оно может работать как в обычном браузере (веб-версия с локальным ИИ через WebAssembly), так и на мобильных устройствах Android в качестве нативного приложения (через Capacitor с аппаратным ИИ-ускорением).
+Cut game assets out of sprite sheets, icon packs and photos — entirely on your phone,
+offline. Select objects on a sheet, and an on-device neural network extracts each one
+as a separate transparent-background image. No servers, no uploads.
 
----
+Built with React + TypeScript + Vite and Capacitor (Android). Inference runs natively
+via ONNX Runtime.
 
-## Содержание
-1. [Описание проекта и его назначения](#описание-проекта-и-его-назначения)
-2. [Используемые технологии и зависимости](#используемые-технологии-и-зависимости)
-3. [Описание структуры каталогов](#описание-структуры-каталогов)
-4. [Описание основных модулей, файлов, классов и функций](#описание-основных-модулей-файлов-классов-и-функций)
-5. [Описание архитектуры и взаимодействия компонентов](#описание-архитектуры-и-взаимодействия-компонентов)
-6. [Инструкции по установке, настройке и запуску](#инструкции-по-установке-настройке-и-запуску)
-7. [Примеры использования](#примеры-использования)
-8. [Описание конфигурации и переменных окружения](#описание-конфигурации-и-переменных-окружения)
-9. [Известные ограничения и особенности](#известные-ограничения-и-особенности)
+## Features
 
----
+- **Object selection on the sheet** — automatic detection, manual boxes, edge
+  snapping, and smart contour-based selection inside a frame.
+- **Per-object AI cutout** — each selection is cropped and segmented individually
+  (BiRefNet on ONNX Runtime), fully on-device; images never leave the phone.
+- **Fallback cascade** — if a small crop confuses the model, the app retries with
+  expanded context, then with a region-level pass, and finally falls back to
+  background-color keying, so a selection rarely comes back empty.
+- **Gallery with a built-in editor** — eraser and restore brushes, crop, rotate,
+  resize with aspect-ratio lock, and PNG/WebP export with a live file-size preview.
+- **Resumable model downloads** — models are fetched on first use with HTTP Range
+  resume and SHA-256 verification, then cached on the device.
+- **Nested-object exclusion** — an object fully contained in another (a gem on a
+  crown) can be subtracted from the parent asset automatically.
 
-## Описание проекта и его назначения
+## Models
 
-**Asset Slicer & SVG Vectorizer** решает задачу быстрого разделения объединенных графических листов на отдельные составляющие элементы. Это крайне полезно для дизайнеров интерфейсов, разработчиков игр и мобильных приложений, работающих со спрайт-листами или паками иконок.
+| Preset | Size | License | Notes |
+| --- | --- | --- | --- |
+| BiRefNet-lite fp16 (default) | 109 MB | MIT | Fast, good general quality |
+| BiRefNet base fp16 ("Quality") | 467 MB | MIT | Swin-Large; catches small/faint objects, needs 8+ GB RAM phones |
+| U2Netp | 4.4 MB | Apache-2.0 | Tiny and fast, lower quality |
 
-Основные функции проекта:
-*   **ИИ-удаление фона**: Автономное сегментирование и удаление фона прямо на устройстве (или через удаленный бэкенд).
-*   **Умная авто-нарезка**: Алгоритм Connected Component Labeling сканирует непрозрачные области и автоматически выделяет их в отдельные контейнеры (слайсы).
-*   **Ручное и интерактивное выделение**:
-    *   Режим ручного рисования рамок выделения.
-    *   Режим **Smart Select** (умный клик), который строит точный контур объекта, исходя из точки нажатия.
-    *   Инструменты тонкой очистки маски: кисть восстановления и ластик.
-*   **Векторизация (Трассировка контуров)**:
-    *   Создание монохромных силуэтов по форме объекта.
-    *   Полноцветная векторизация с квантованием цветов и послойным наложением контуров.
-    *   Внедрение оптимизированного растра (PNG или WebP с регулируемым качеством) внутрь масштабируемого SVG-контейнера.
-*   **Гибридный экспорт**: Сохранение отдельных файлов (SVG, PNG, WebP) или скачивание всех выделенных элементов в один клик в виде структурированного ZIP-архива.
+Both BiRefNet presets are fp16 conversions of the MIT-licensed weights with fp32
+inputs/outputs kept. Interface: input tensor `input_image`, 1024×1024, ImageNet
+normalization; output is logits, passed through sigmoid. You can also add any custom
+ONNX model by URL from the settings screen.
 
----
+**Note for forks:** the preset URLs point to the original author's server. If you fork
+this project, host the model files yourself and update the URLs in `src/App.tsx`. The
+models can be produced from the [onnx-community/BiRefNet-ONNX](https://huggingface.co/onnx-community/BiRefNet-ONNX)
+/ [onnx-community/BiRefNet_lite-ONNX](https://huggingface.co/onnx-community/BiRefNet_lite-ONNX)
+exports with `onnxconverter_common.float16.convert_float_to_float16(keep_io_types=True)`.
+Your server must support HTTP Range requests, or interrupted downloads will not resume.
 
-## Используемые технологии и зависимости
+## Build
 
-### Frontend (React / TypeScript / Vite)
-*   **React 19 (19.0.1)** & **React DOM 19**: Декларативное управление интерфейсом и состоянием.
-*   **Vite 6.2.3**: Инструмент сборки с поддержкой HMR и проксирования запросов к API.
-*   **Tailwind CSS v4 (4.1.14)** & `@tailwindcss/vite`: Современный CSS-фреймворк для стилизации.
-*   **Motion / Framer Motion (12.23.24)**: Библиотека для плавных микро-анимаций интерфейса и переходов.
-*   **Lucide React (0.546.0)**: Набор оптимизированных векторных иконок.
-*   **JSZip (3.10.1)**: Генерация ZIP-архивов на стороне клиента.
-*   **@imgly/background-removal (1.7.0)** & **@imgly/background-removal-data (1.4.5)**: Библиотеки для удаления фона с помощью нейросетей в среде WebAssembly в браузере.
+Requirements: Node.js 20+, JDK 21, Android SDK.
 
-### Android Native & Capacitor
-*   **Capacitor Core, CLI, Android (8.4.1 / 7.6.7)**: Фреймворк для оборачивания веб-приложения в нативный контейнер Android.
-*   **Capacitor Filesystem (8.1.2)**: API для нативной работы с файловой системой Android (сохранение результатов в директорию `Documents`).
-*   **ONNX Runtime Mobile (ai.onnxruntime)**: Среда выполнения ИИ-моделей на Android с поддержкой аппаратного ускорения **NNAPI** (Neural Networks API).
-*   **Kotlin (Kotlin Standard Library)** & **Java**: Нативная логика плагина удаления фона.
-*   **Fast Guided Filter**: Нативный алгоритм уточнения краев масок изображений высокого разрешения с потоковой обработкой строк для избежания нехватки памяти (OOM).
-
-### Бэкенд-сервисы (Python и Rust)
-Проект содержит три независимых серверных компонента (микросервиса) для вспомогательной обработки:
-1.  **`backend/` (FastAPI / Python)**:
-    *   `fastapi==0.111.0`, `uvicorn==0.30.1`, `rembg==2.0.57` (на базе ONNX), `pillow==10.3.0`.
-    *   Реализует удаление фона на сервере через POST `/api/remove-bg`.
-2.  **`api_python/` (FastAPI / Python)**:
-    *   `fastapi`, `numpy`, `opencv-python-headless`, `Pillow`.
-    *   Выполняет алгоритмическое улучшение краев (Alpha Erosion, Color Decontamination, Anti-Aliasing) через POST `/api/clean-asset`.
-3.  **`api_rust/` (Axum / Rust)**:
-    *   `axum`, `tokio`, `image` (библиотека обработки изображений), `tower-http` (CORS).
-    *   Альтернативная высокопроизводительная реализация постобработки краев ассетов (идентичная `api_python`), доступная по адресу `/api/clean-asset`.
-
----
-
-## Описание структуры каталогов
-
-```
-/root/asset_slicer/
-├── .agents/                    # Конфигурационные файлы агентов
-├── android/                    # Исходный код нативного Android-проекта
-│   ├── app/
-│   │   ├── build.gradle        # Конфигурация сборки модуля app
-│   │   └── src/
-│   │       ├── main/
-│   │       │   ├── AndroidManifest.xml
-│   │       │   ├── assets/     # Скомпилированный веб-дистрибутив (dist) и конфиги Capacitor
-│   │       │   └── java/com/assetslicer/app/
-│   │       │       ├── MainActivity.java                # Точка входа Android-приложения
-│   │       │       └── BackgroundRemovalPlugin.kt       # Нативный плагин удаления фона с ONNX Runtime
-│   │       └── test/           # Тесты Android
-│   ├── build.gradle            # Корневой Gradle-конфиг проекта Android
-│   └── settings.gradle         # Настройки Gradle
-├── api_python/                 # Микросервис на Python для постобработки краев
-│   ├── main.py                 # Логика FastAPI и функции эрозии/деконтаминации
-│   └── requirements.txt
-├── api_rust/                   # Альтернативный микросервис на Rust для постобработки краев
-│   ├── Cargo.toml
-│   └── src/
-│       └── main.rs             # Сервер Axum и реализация алгоритмов очистки на Rust
-├── backend/                    # Микросервис на Python для ИИ-удаления фона (rembg)
-│   ├── main.py                 # FastAPI сервер (порт 5000)
-│   └── requirements.txt
-├── src/                        # Исходный код React Frontend
-│   ├── App.tsx                 # Главный компонент, разметка страниц и логика настроек
-│   ├── index.css               # Глобальные стили Tailwind CSS v4
-│   ├── main.tsx                # Точка входа React
-│   ├── types.ts                # TypeScript интерфейсы (Slice, ProcessedAsset, Rect и др.)
-│   ├── components/             # React компоненты UI
-│   │   ├── AssetCard.tsx       # Карточка управления отдельным нарезанным ассетом
-│   │   ├── ImageUploader.tsx   # Компонент загрузки изображений и запуска демонстрационных шаблонов
-│   │   └── Workspace.tsx       # Холст интерактивного редактирования (зум, хромакей, маски, слайсинг)
-│   └── utils/                  # Вспомогательные модули
-│       ├── downloadHelper.ts   # Логика загрузки файлов (браузер / нативная Android FS)
-│       ├── imageProcess.ts     # Алгоритмы авто-нарезки, трассировки контуров и генерации SVG
-│       ├── imageProcess.test.ts # Тестовые сценарии для проверки стабильности трассировки контуров
-│       └── taskQueue.ts        # Очередь неблокирующих «тяжелых» задач для интерфейса
-├── package.json                # Зависимости npm и скрипты сборки
-├── vite.config.ts              # Конфигурация Vite и кастомный плагин MIME-типов для ONNX/APK
-├── tsconfig.json               # Конфигурация TypeScript
-├── test_stopping_criteria.ts   # Скрипт верификации критериев останова трассировки (bowtie-тест)
-└── test_trace_contours.ts      # Скрипт стресс-тестирования трассировщика контуров
-```
-
----
-
-## Описание основных модулей, файлов, классов и функций
-
-### Нативный Android-плагин (`BackgroundRemovalPlugin.kt`)
-*   **`BackgroundRemovalPlugin`**: Наследник `com.getcapacitor.Plugin`. Предоставляет JavaScript-слою доступ к ИИ-удалению фона на базе ONNX-моделей.
-    *   `preloadModel(call)`: Скачивает `.onnx` модель по сети во внутренний кэш приложения. Поддерживает редиректы HTTP-запросов и транслирует прогресс загрузки в веб-интерфейс через события `downloadProgress`.
-    *   `removeBackground(call)`: Основная точка входа для удаления фона. Принимает изображение (Base64 или URI), масштабирует его под входной размер модели (например, 1024x1024), подготавливает нормализованный тензор, запускает инференс через ONNX Runtime (с попыткой включения NNAPI) и применяет **Fast Guided Filter** для получения финального изображения высокого разрешения.
-    *   `releaseModel(call)`: Освобождает память, закрывая сессию и окружение ONNX.
-    *   `isModelCached(call)` & `clearCachedModels(call)`: Управление локальным кэшем моделей и временных файлов PNG.
-*   **`GuidedFilterRefinement`**: Реализует Edge Refinement с помощью быстрого направленного фильтра.
-    *   `refineMask(...)`: Принимает оригинальное изображение высокого разрешения и низкоразрешенную маску от модели ИИ. Выполняет математические расчеты на уменьшенной сетке (512x512) и восстанавливает маску до полного разрешения построчно (`line-by-line streaming`), исключая переполнение памяти (OOM) на мобильных телефонах.
-    *   `boxFilter(...)`: Разделяемый двумерный скользящий средний фильтр со сложностью $O(W \times H)$.
-
-### Алгоритмы обработки изображений (`src/utils/imageProcess.ts`)
-*   **`detectSlices(imageData, minSize, mergeDistance, padding)`**: Автоматический поиск отдельных элементов.
-    1.  Сканирует альфа-канал изображения по уменьшенной сетке для быстродействия на мобильных телефонах.
-    2.  Запускает поиск связных компонентов (BFS Connected Component Labeling) на бинарной сетке.
-    3.  Фильтрует мелкий шум (порог `minSize`).
-    4.  Итеративно объединяет близкие рамки (порог `mergeDistance`).
-    5.  Ужимает рамки до точных границ пикселей с помощью `trimTransparentMargins` и добавляет внешний `padding`.
-*   **`findConnectedComponentAt(imageData, startX, startY, alphaThreshold, padding)`**: Алгоритм **Smart Select** (умного клика).
-    1.  Если точка клика прозрачна, находит ближайший непрозрачный пиксель в радиусе до 100 пикселей.
-    2.  Запускает BFS по 8 направлениям на пиксельном уровне от начальной точки для выделения связной фигуры.
-    3.  Возвращает точный ограничивающий прямоугольник (`Rect`).
-*   **`traceContours(imageData, alphaThreshold)`**: Извлекает полигональные границы альфа-островов. Использует алгоритм Moore-Neighbor Tracing (8-connected) с критерием останова Якоба (останов при повторном прохождении первых двух пикселей в том же направлении), что предотвращает зацикливание на сложных геометрических фигурах (например, «галстук-бабочка» / bowtie).
-*   **`simplifyPoints(points, epsilon)`**: Реализация алгоритма Рамера-Дугласа-Пекера для минимизации количества точек контура при генерации векторного пути (уменьшает размер SVG).
-*   **`generateColorLayersSvg(imageData, targetColorsCount)`**: Цветовая векторизация.
-    1.  Анализирует непрозрачные пиксели и находит наиболее частые цвета в палитре.
-    2.  Сортирует и группирует пиксели методом квантования цвета.
-    3.  Строит бинарные маски для каждого доминантного цвета и запускает для них `traceContours`.
-    4.  Формирует SVG-код с наложенными друг на друга цветными контурами `<path fill="...">`.
-*   **`generateSilhouetteSvg(...)`**: Строит монохромный векторный силуэт по общему альфа-контуру.
-*   **`generateEmbeddedSvg(width, height, pngDataUrl)`**: Оборачивает растровый PNG/WebP (в кодировке Base64 Data URL) в контейнер `<svg>` с сохранением масштабирования.
-
-### Очередь задач (`src/utils/taskQueue.ts`)
-*   **`enqueueHeavyTask(task, id, version)`**: Обеспечивает последовательное выполнение ресурсоемких математических задач (кадрирование, трассировка контуров, рендеринг SVG).
-*   Предотвращает зависание UI-потока за счет использования промисов (`Promise.resolve()`) и контролируемого возврата управления браузеру через микросекундные тайм-ауты (`yieldToMain()`).
-*   Поддерживает версионирование задач: если пользователь быстро двигает ползунки, старые версии задач в очереди автоматически сбрасываются (`isTaskVersionActive` проверяет актуальность), экономя процессорное время.
-
-### Экспорт файлов (`src/utils/downloadHelper.ts`)
-*   **`downloadTextFile(filename, content)`** & **`downloadBinaryFile(filename, base64Content, blobFallback)`**:
-    *   **В вебе**: Динамически генерирует ссылки `URL.createObjectURL(blob)` и эмулирует клик для стандартного скачивания через браузер.
-    *   **В нативном приложении**: Проверяет и запрашивает права на запись во внешнее хранилище Android, затем с помощью Capacitor Filesystem сохраняет файл по пути `Documents/{exportFolder}/{filename}`.
-
----
-
-## Описание архитектуры и взаимодействия компонентов
-
-Приложение спроектировано по модульной клиент-серверной схеме с разделением нативного и веб-контекстов:
-
-```mermaid
-graph TD
-    User([Пользователь]) -->|Загружает изображение| App[App.tsx]
-    App -->|Включает ИИ-удаление фона| BgRemove{Платформа?}
-    
-    BgRemove -->|Веб-браузер| WASM[@imgly/background-removal]
-    BgRemove -->|Android Native| CapacitorPlugin[BackgroundRemovalPlugin.kt]
-    BgRemove -->|Серверный API| FastAPI_5000[rembg FastAPI порт 5000]
-    
-    CapacitorPlugin -->|NNAPI / CPU| ONNX[ONNX Runtime Mobile]
-    ONNX -->|Сырая маска| GuidedFilter[GuidedFilterRefinement]
-    GuidedFilter -->|Качественный PNG| App
-    WASM -->|Результат| App
-    FastAPI_5000 -->|Результат| App
-    
-    App -->|Управление слайсами| Workspace[Workspace.tsx Canvas]
-    Workspace -->|Авто-поиск объектов| ImageProcess[imageProcess.ts: detectSlices]
-    Workspace -->|Smart Select| ImageProcess2[imageProcess.ts: findConnectedComponentAt]
-    Workspace -->|Ластик / Восстановление| BrushMask[Маска рисования brushMask]
-    
-    App -->|Список нарезок| AssetCard[AssetCard.tsx]
-    AssetCard -->|Задачи трассировки/SVG| TaskQueue[taskQueue.ts: enqueueHeavyTask]
-    TaskQueue -->|Контурный анализ| Tracing[imageProcess.ts: traceContours]
-    Tracing -->|Упрощение| RDP[imageProcess.ts: simplifyPoints]
-    
-    AssetCard -->|Сохранение файла| DownloadHelper[downloadHelper.ts]
-    DownloadHelper -->|Нативная запись| AndroidFS[Capacitor Filesystem / Documents]
-    DownloadHelper -->|Веб-скачивание| BrowserDownload[Браузерная загрузка]
-```
-
-### Пайплайн обработки изображений
-1.  **Загрузка**: Изображение считывается в виде Blob-объекта (или нативного пути файла).
-2.  **Сегментация**:
-    *   При нативном запуске плагин `BackgroundRemoval` скачивает выбранную ONNX модель (`RMBG-1.4` или `U2Netp`). Входная картинка прогоняется через сеть.
-    *   Полученная альфа-маска низкого разрешения сглаживается с помощью Fast Guided Filter по каналам исходного изображения высокого разрешения.
-    *   Создается PNG с прозрачным фоном, который передается обратно в WebView.
-3.  **Слайсинг**:
-    *   `Workspace.tsx` на основе альфа-канала сгенерированного изображения автоматически разделяет его на прямоугольники (или пользователь рисует их вручную/кликом).
-4.  **Рендеринг векторов**:
-    *   Каждый прямоугольник обрезается. Если активна опция `trimMargins`, пустые прозрачные границы отсекаются.
-    *   В зависимости от выбранного режима в `AssetCard.tsx` (`silhouette`, `color`, `embedded`) алгоритмы в `imageProcess.ts` генерируют валидный SVG-код.
-    *   Все вызовы векторизации проходят через `taskQueue.ts`, чтобы сохранить отзывчивость UI (особенно на мобильных WebView с ограниченными ресурсами CPU).
-
----
-
-## Инструкции по установке, настройке и запуску
-
-### Предварительные требования
-*   Установленный **Node.js** (версия 18 или выше).
-*   Для сборки под Android: **Android Studio** и настроенный Android SDK.
-*   Для работы Python-сервисов: **Python 3.10+**.
-*   Для работы Rust-сервиса: **Rust / Cargo**.
-
----
-
-### Шаг 1: Установка фронтенд-зависимостей
-Перейдите в корень проекта и установите Node-пакеты:
 ```bash
 npm install
+npx vite build
+npx cap sync android
+cd android && ./gradlew assembleDebug
 ```
 
-### Шаг 2: Запуск веб-интерфейса в режиме разработки
-Запустите локальный сервер Vite (веб-версия будет доступна по адресу `http://localhost:3000`):
-```bash
-npm run dev
+The APK ends up in `android/app/build/outputs/apk/debug/`. The web build is UI-only:
+AI processing is implemented in the native Android plugin, so in a browser only the
+non-AI background-color cutout works.
+
+## Project structure
+
+```
+src/
+  App.tsx                 # main flow: selection → processing → gallery
+  components/
+    ObjectSelector.tsx    # object selection on the sheet
+    AssetGallery.tsx      # gallery of extracted assets
+    AssetEditor.tsx       # per-asset editor (erase/restore, crop, export)
+  plugins/
+    backgroundRemoval.ts  # Capacitor bridge to the native plugin
+android/
+  .../BackgroundRemovalPlugin.kt  # ONNX Runtime inference (CPU EP), resumable
+                                  # model download, raw-mask mode
+tools/
+  pipeline.py             # Python reference of the native processing pipeline
 ```
 
----
+## Security note
 
-### Шаг 3: Настройка и запуск бэкенд-сервисов (необязательно)
+The repository contains a `debug.keystore` so that debug builds installed from
+releases can be updated in place. It is a well-known debug key — for any production
+distribution, generate your own signing key and do not commit it.
 
-#### Запуск Rust API постобработки краев (порт 3000)
-```bash
-cd api_rust
-cargo run --release
-```
-Сервер запустится на `http://localhost:3000` и будет готов принимать Multipart-запросы на очистку краев `/api/clean-asset`.
+## License
 
-#### Запуск Python API постобработки краев (порт 3000)
-```bash
-cd api_python
-pip install -r requirements.txt
-python main.py
-```
-Сервер запустится на `http://localhost:3000` и будет работать аналогично Rust-серверу.
-
-#### Запуск Python бэкенда ИИ-удаления фона (порт 5000)
-Vite перенаправляет запросы с фронтенда с префиксом `/api` на порт 5000.
-```bash
-cd backend
-pip install -r requirements.txt
-python main.py
-```
-FastAPI-сервер запустится на `http://localhost:5000` и предоставит эндпоинт `/api/remove-bg`.
-
----
-
-### Шаг 4: Сборка и запуск нативного Android-приложения
-1.  Скомпилируйте фронтенд-код:
-    ```bash
-    npm run build
-    ```
-2.  Синхронизируйте собранный дистрибутив с проектом Android Capacitor:
-    ```bash
-    npx cap sync
-    ```
-3.  Откройте проект в Android Studio для компиляции и установки на устройство/эмулятор:
-    ```bash
-    npx cap open android
-    ```
-4.  В Android Studio нажмите **Run** для запуска приложения на подключенном смартфоне.
-
----
-
-## Примеры использования
-
-### Тестирование на демонстрационных шаблонах
-1.  Откройте приложение.
-2.  Внизу страницы загрузки нажмите одну из кнопок быстрого теста:
-    *   **Лист иконок (Белый фон)** — сгенерирует в памяти холст с тремя иконками (сердце, звезда, алмаз) на белом фоне.
-    *   **Лист логотипов (Светлый фон)** — сгенерирует холст с разноцветными геометрическими логотипами.
-3.  Приложение автоматически удалит фон (если включен тумблер AI) и выделит объекты в рамки.
-
-### Автоматическая нарезка и экспорт
-1.  Загрузите свое изображение (или сделайте снимок на камеру телефона).
-2.  Перейдите во вкладку **Фон** (в боковой или нижней панели) и отрегулируйте параметры допуска цвета или сотрите лишние детали ластиком.
-3.  Перейдите во вкладку **Нарезка** и настройте ползунки:
-    *   *Допуск цвета фона*: диапазон чувствительности удаления фона.
-    *   *Расстояние слияния*: минимальное расстояние между объектами, при котором они объединяются в одну рамку.
-    *   *Размер объекта*: фильтр шума (объекты меньше этого размера игнорируются).
-4.  Нажмите кнопку **Скачать все ассеты в ZIP-архиве** для сохранения всей нарезки в один архив. Каждому файлу будет присвоено имя, указанное в карточке ассета.
-
----
-
-## Описание конфигурации и переменных окружения
-
-### Переменные окружения (`.env`)
-При запуске в AI Studio или на хостинге могут использоваться следующие параметры:
-*   `GEMINI_API_KEY`: Ключ доступа к Gemini API для серверных ИИ-функций.
-*   `APP_URL`: Базовый URL-адрес хостинга приложения (используется для OAuth и API-интеграций).
-*   `DISABLE_HMR`: Если установлено в значение `true`, Vite отключает файловый мониторинг (File Watching) и горячую перезагрузку для снижения нагрузки на процессор.
-
-### Настройки локального хранилища (`localStorage`)
-Приложение сохраняет пользовательские конфигурации в браузере:
-*   `localModel`: Идентификатор активной ИИ-модели для веб-версии (`isnet_quint8`, `isnet_fp16`, `birefnet`).
-*   `modelDownloadUrl`: URL-путь к CDN-директории с бинарными весами веб-моделей.
-*   `customModelUrl`: URL-адрес скачивания ONNX-модели нативной версии Android (по умолчанию `http://78.17.74.156:3000/model_quantized.onnx`).
-*   `exportFolder`: Имя подпапки в Android-директории `Documents`, куда будут экспортироваться ассеты (по умолчанию `Download`).
-*   `user_models_list`: JSON-массив зарегистрированных пользователем кастомных ONNX-моделей.
-
----
-
-## Известные ограничения и особенности
-
-1.  **Лимиты оперативной памяти (OOM)**:
-    *   Обработка больших фотографий с разрешением 4K+ на мобильных телефонах может вызывать сбои WebView. Для минимизации рисков нативное ядро Android сжимает входной кадр для ИИ-инференса до фиксированного размера (обычно 1024x1024), а затем выполняет реконструкцию оригинального разрешения с использованием алгоритма Fast Guided Filter, оптимизированного по памяти.
-2.  **Сглаживание контуров при трассировке**:
-    *   Упрощение контуров по методу Рамера-Дугласа-Пекера использует фиксированную величину отклонения $\epsilon = 0.7$ пикселя. Это оптимальный баланс между качеством сглаживания углов и размером файла SVG.
-3.  **Потребление сетевого трафика**:
-    *   Веса нейросетей для точного сегментирования фона (`BiRefNet`, `RMBG-1.4`) составляют от 43 МБ до 120+ МБ. При первом запуске в нативной или веб-версии требуется стабильное интернет-соединение для их полной загрузки. Последующие запуски используют кэшированные локальные файлы.
-4.  **CORS в веб-версии**:
-    *   Загрузка моделей напрямую из CDN-репозиториев в браузере жестко регламентируется правилами CORS. При развертывании веб-версии рекомендуется размещать файлы моделей на одном хосте с фронтендом или на серверах со свободными заголовками `Access-Control-Allow-Origin: *`.
+MIT — see [LICENSE](LICENSE). Third-party components and model licenses are listed in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

@@ -46,6 +46,10 @@ const getSha256ForUrl = (url: string): string | undefined =>
 
 const formatMb = (bytes: number): number => Math.round(bytes / (1024 * 1024));
 
+/** ИИ-обработка работает только в нативном приложении (onnxruntime на устройстве). */
+const WEB_AI_UNSUPPORTED_MESSAGE =
+  'Обработка доступна в мобильном приложении (Android). Соберите APK или скачайте его из релизов.';
+
 interface SavedModel {
   name: string;
   url: string;
@@ -68,13 +72,6 @@ const DEFAULT_PRESETS: SavedModel[] = [
     sizeLabel: '467 МБ',
     isPreset: true,
     description: 'Полный Swin-Large: берёт мелкие и бледные объекты, которые lite пропускает. В 4–6 раз медленнее и требует много памяти — для мощных телефонов (8+ ГБ ОЗУ). Докачка и проверка суммы включены.'
-  },
-  {
-    name: 'RMBG-1.4 (Bria AI)',
-    url: 'https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model.onnx',
-    sizeLabel: '43 МБ',
-    isPreset: true,
-    description: 'Рекомендуется. Премиум качество, отлично определяет мелкие детали, волосы и сложные границы.'
   },
   {
     name: 'U2Netp (Lightweight)',
@@ -571,12 +568,6 @@ export default function App() {
   // Модалка подтверждения очистки кэша моделей (ввод «УДАЛИТЬ»)
   const [isClearCacheOpen, setIsClearCacheOpen] = useState(false);
   const [clearCacheInput, setClearCacheInput] = useState('');
-  const [localModel, setLocalModel] = useState<string>(() => {
-    return localStorage.getItem('localModel') || 'isnet_quint8';
-  });
-  const [modelDownloadUrl, setModelDownloadUrl] = useState<string>(() => {
-    return localStorage.getItem('modelDownloadUrl') || (window.location.origin + '/assets/background-removal-data/');
-  });
   const [customModelUrl, setCustomModelUrl] = useState<string>(() => {
     // Пользовательское значение из настроек не перетираем, дефолт — BiRefNet-lite
     return localStorage.getItem('customModelUrl') || BIREFNET_MODEL_URL;
@@ -761,28 +752,23 @@ export default function App() {
    */
   const aiResultCacheRef = useRef<Array<{ rect: Rect; canvas: HTMLCanvasElement }>>([]);
 
-  /** Прогоняет ИИ-удаление фона по canvas (native raw / imgly web) → PNG-blob. */
+  /** Прогоняет ИИ-удаление фона по canvas (нативный raw-режим) → PNG-blob. */
   const runAIOnCanvas = useCallback(async (cropCanvas: HTMLCanvasElement): Promise<Blob> => {
-    if (Capacitor.isNativePlatform()) {
-      const cropDataUrl = cropCanvas.toDataURL('image/png');
-      const result = await BackgroundRemoval.removeBackground({
-        image: cropDataUrl,
-        url: customModelUrl,
-        raw: true,
-      });
-      const response = await fetch(Capacitor.convertFileSrc(result.uri));
-      if (!response.ok) {
-        throw new Error(`Не удалось прочитать результат ИИ (HTTP ${response.status})`);
-      }
-      return response.blob();
+    if (!Capacitor.isNativePlatform()) {
+      throw new Error(WEB_AI_UNSUPPORTED_MESSAGE);
     }
-    const cropBlob = await canvasToBlob(cropCanvas);
-    const { removeBackground } = await import('@imgly/background-removal');
-    return removeBackground(cropBlob, {
-      model: localModel as any,
-      publicPath: modelDownloadUrl,
+    const cropDataUrl = cropCanvas.toDataURL('image/png');
+    const result = await BackgroundRemoval.removeBackground({
+      image: cropDataUrl,
+      url: customModelUrl,
+      raw: true,
     });
-  }, [customModelUrl, localModel, modelDownloadUrl]);
+    const response = await fetch(Capacitor.convertFileSrc(result.uri));
+    if (!response.ok) {
+      throw new Error(`Не удалось прочитать результат ИИ (HTTP ${response.status})`);
+    }
+    return response.blob();
+  }, [customModelUrl]);
 
   /** ИИ по региону (bbox всех выделений) с кэшем (см. regionAICacheRef). */
   const getRegionAICanvas = useCallback(async (
@@ -992,6 +978,13 @@ export default function App() {
   ) => {
     const dataUrl = originalImageSrc;
     if (!dataUrl || selections.length === 0) return;
+
+    // ИИ-обработка есть только в нативном приложении: в браузере сразу
+    // объясняем это пользователю (вырез по цвету фона без ИИ работает и в вебе)
+    if (!Capacitor.isNativePlatform() && useAIBgRemoval) {
+      alert(WEB_AI_UNSUPPORTED_MESSAGE);
+      return;
+    }
 
     const requestId = ++imageLoadRequestIdRef.current;
     setView('processing');
@@ -1381,65 +1374,48 @@ export default function App() {
   }, [clearObjectAssets]);
 
   const preloadLocalModel = async () => {
+    if (!Capacitor.isNativePlatform()) {
+      alert(WEB_AI_UNSUPPORTED_MESSAGE);
+      return;
+    }
     setIsModelDownloading(true);
     setModelDownloadProgress(0);
     setModelFetchInfo(null);
     let progressListener: { remove: () => void } | null = null;
     let legacyListener: { remove: () => void } | null = null;
     try {
-      if (Capacitor.isNativePlatform()) {
-        const totalFallback = customModelUrl === BIREFNET_MODEL_URL ? BIREFNET_MODEL_SIZE_BYTES : customModelUrl === BIREFNET_BASE_MODEL_URL ? BIREFNET_BASE_MODEL_SIZE_BYTES : 0;
-        progressListener = await BackgroundRemoval.addListener(
-          'modelDownloadProgress',
-          (info) => {
-            if (!info || typeof info.loaded !== 'number') return;
-            const total = info.total > 0 ? info.total : totalFallback;
-            setModelFetchInfo({ loaded: info.loaded, total, resumed: !!info.resumed });
-            if (total > 0) {
-              setModelDownloadProgress(
-                Math.max(0, Math.min(100, Math.round((info.loaded / total) * 100)))
-              );
-            }
+      const totalFallback = customModelUrl === BIREFNET_MODEL_URL ? BIREFNET_MODEL_SIZE_BYTES : customModelUrl === BIREFNET_BASE_MODEL_URL ? BIREFNET_BASE_MODEL_SIZE_BYTES : 0;
+      progressListener = await BackgroundRemoval.addListener(
+        'modelDownloadProgress',
+        (info) => {
+          if (!info || typeof info.loaded !== 'number') return;
+          const total = info.total > 0 ? info.total : totalFallback;
+          setModelFetchInfo({ loaded: info.loaded, total, resumed: !!info.resumed });
+          if (total > 0) {
+            setModelDownloadProgress(
+              Math.max(0, Math.min(100, Math.round((info.loaded / total) * 100)))
+            );
           }
-        );
-        // Легаси-событие с процентами — как фолбэк для старых версий плагина
-        legacyListener = await BackgroundRemoval.addListener(
-          'downloadProgress',
-          (info) => {
-            if (info && typeof info.percent === 'number') {
-              setModelDownloadProgress(info.percent);
-            }
+        }
+      );
+      // Легаси-событие с процентами — как фолбэк для старых версий плагина
+      legacyListener = await BackgroundRemoval.addListener(
+        'downloadProgress',
+        (info) => {
+          if (info && typeof info.percent === 'number') {
+            setModelDownloadProgress(info.percent);
           }
-        );
+        }
+      );
 
-        await BackgroundRemoval.preloadModel({
-          url: customModelUrl,
-          sha256: getSha256ForUrl(customModelUrl),
-        });
-        await checkCustomModelCacheStatus();
-        setIsModelDownloading(false);
-        setModelDownloadProgress(null);
-        alert('Модель ИИ успешно загружена и кэширована!');
-      } else {
-        const { preload } = await import('@imgly/background-removal');
-        await preload({
-          model: localModel as any,
-          publicPath: modelDownloadUrl,
-          progress: (key, current, total) => {
-            let percent = 0;
-            if (total && !isNaN(total) && total > 0) {
-              percent = Math.round((current / total) * 100);
-            } else if (current > 0) {
-              percent = Math.min(95, Math.round(current / (1024 * 1024)));
-            }
-            const displayPercent = Math.min(100, Math.max(0, percent));
-            setModelDownloadProgress(displayPercent);
-          }
-        });
-        alert('Модель ИИ успешно загружена и кэширована!');
-        setIsModelDownloading(false);
-        setModelDownloadProgress(null);
-      }
+      await BackgroundRemoval.preloadModel({
+        url: customModelUrl,
+        sha256: getSha256ForUrl(customModelUrl),
+      });
+      await checkCustomModelCacheStatus();
+      setIsModelDownloading(false);
+      setModelDownloadProgress(null);
+      alert('Модель ИИ успешно загружена и кэширована!');
     } catch (err) {
       console.error('Failed to preload local model:', err);
       alert('Ошибка при загрузке модели: ' + String((err as any).message || err));
@@ -1892,126 +1868,20 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                /* Card 1: AI Model Selection for Web */
-                <div className="bg-zinc-900/15 border border-zinc-850/60 rounded-2xl p-5 space-y-4 shadow-md relative overflow-hidden backdrop-blur-md">
+                /* Card 1 (web): AI processing is native-only */
+                <div className="bg-zinc-900/15 border border-zinc-850/60 rounded-2xl p-5 space-y-3 shadow-md relative overflow-hidden backdrop-blur-md">
                   <div className="absolute inset-0 bg-gradient-to-tr from-violet-600/4 via-indigo-600/1 to-transparent pointer-events-none" />
-                  
+
                   <div className="flex items-center gap-2">
                     <Sparkles className="w-4 h-4 text-violet-400" />
-                    <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">Модель ИИ (веб-версия)</label>
+                    <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">ИИ-обработка (только Android)</label>
                   </div>
 
-                  <div className="grid grid-cols-1 gap-3">
-                    {/* Web Option 1: isnet_quint8 */}
-                    <div 
-                      onClick={() => {
-                        const url = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal-data@1.4.5/dist/';
-                        setModelDownloadUrl(url);
-                        localStorage.setItem('modelDownloadUrl', url);
-                        setLocalModel('isnet_quint8');
-                        localStorage.setItem('localModel', 'isnet_quint8');
-                      }}
-                      className={`p-4 rounded-2xl border transition-all duration-300 cursor-pointer flex flex-col gap-2 relative overflow-hidden active:scale-[0.98] active:translate-y-[1px] ${
-                        localModel === 'isnet_quint8'
-                          ? 'bg-emerald-950/25 border-emerald-500 shadow-[0_4px_20px_rgba(16,185,129,0.15)]'
-                          : 'bg-zinc-950/50 border-zinc-850/70 hover:bg-zinc-900/30 hover:border-zinc-700/60'
-                      }`}
-                    >
-                      <div className="flex justify-between items-center">
-                        <div className="flex items-center gap-2">
-                          <div className={`w-2 h-2 rounded-full ${localModel === 'isnet_quint8' ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-650'}`} />
-                          <span className="text-xs font-bold text-zinc-200 font-sans tracking-tight">isnet_quint8 (Быстрая)</span>
-                        </div>
-                        <span className="text-[10px] px-2 py-0.5 rounded bg-zinc-900/80 text-zinc-400 font-mono font-bold">22 МБ</span>
-                      </div>
-                      <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                        Оптимизирована для мобильных и слабых ПК. Быстрый запуск, минимальное потребление ресурсов.
-                      </p>
-                    </div>
-
-                    {/* Web Option 2: isnet_fp16 */}
-                    <div 
-                      onClick={() => {
-                        const url = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal-data@1.4.5/dist/';
-                        setModelDownloadUrl(url);
-                        localStorage.setItem('modelDownloadUrl', url);
-                        setLocalModel('isnet_fp16');
-                        localStorage.setItem('localModel', 'isnet_fp16');
-                      }}
-                      className={`p-4 rounded-2xl border transition-all duration-300 cursor-pointer flex flex-col gap-2 relative overflow-hidden active:scale-[0.98] active:translate-y-[1px] ${
-                        localModel === 'isnet_fp16'
-                          ? 'bg-violet-950/25 border-violet-500 shadow-[0_4px_20px_rgba(139,92,246,0.15)]'
-                          : 'bg-zinc-950/50 border-zinc-850/70 hover:bg-zinc-900/30 hover:border-zinc-700/60'
-                      }`}
-                    >
-                      <div className="flex justify-between items-center">
-                        <div className="flex items-center gap-2">
-                          <div className={`w-2 h-2 rounded-full ${localModel === 'isnet_fp16' ? 'bg-violet-400 animate-pulse' : 'bg-zinc-650'}`} />
-                          <span className="text-xs font-bold text-zinc-200 font-sans tracking-tight">isnet_fp16 (Средняя)</span>
-                        </div>
-                        <span className="text-[10px] px-2 py-0.5 rounded bg-zinc-900/80 text-zinc-400 font-mono font-bold">44 МБ</span>
-                      </div>
-                      <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                        Стандартная модель. Оптимальное качество удаления фона для большинства картинок.
-                      </p>
-                    </div>
-
-                    {/* Web Option 3: birefnet */}
-                    <div 
-                      onClick={() => {
-                        const url = 'https://huggingface.co/ZhengPeng7/BiRefNet/resolve/main/';
-                        setModelDownloadUrl(url);
-                        localStorage.setItem('modelDownloadUrl', url);
-                        setLocalModel('birefnet');
-                        localStorage.setItem('localModel', 'birefnet');
-                      }}
-                      className={`p-4 rounded-2xl border transition-all duration-300 cursor-pointer flex flex-col gap-2 relative overflow-hidden active:scale-[0.98] active:translate-y-[1px] ${
-                        localModel === 'birefnet'
-                          ? 'bg-indigo-950/25 border-indigo-500 shadow-[0_4px_20px_rgba(99,102,241,0.15)]'
-                          : 'bg-zinc-950/50 border-zinc-850/70 hover:bg-zinc-900/30 hover:border-zinc-700/60'
-                      }`}
-                    >
-                      <div className="flex justify-between items-center">
-                        <div className="flex items-center gap-2">
-                          <div className={`w-2 h-2 rounded-full ${localModel === 'birefnet' ? 'bg-indigo-400 animate-pulse' : 'bg-zinc-650'}`} />
-                          <span className="text-xs font-bold text-zinc-200 font-sans tracking-tight">BiRefNet (Максимальная точность)</span>
-                        </div>
-                        <span className="text-[10px] px-2 py-0.5 rounded bg-zinc-900/80 text-zinc-400 font-mono font-bold">120+ МБ</span>
-                      </div>
-                      <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                        Новейшая и самая точная модель ИИ. Требует быстрой сети и хорошей производительности.
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Browser Download Progress */}
-                  <div className="pt-2 border-t border-zinc-850/60">
-                    {isModelDownloading ? (
-                      <div className="bg-zinc-950/60 border border-zinc-850 rounded-2xl p-4 space-y-2.5">
-                        <div className="flex justify-between text-[11px] font-bold text-zinc-300">
-                          <span className="flex items-center gap-1.5 font-sans">
-                            <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-400" />
-                            Загрузка модели ({localModel})...
-                          </span>
-                          <span className="text-violet-400 font-mono">{modelDownloadProgress}%</span>
-                        </div>
-                        <div className="w-full bg-zinc-950 h-2 border border-zinc-850 rounded-full overflow-hidden p-0.5">
-                          <div
-                            className="bg-gradient-to-r from-violet-500 to-emerald-500 h-full rounded-full transition-all duration-300 ease-out"
-                            style={{ width: `${modelDownloadProgress}%` }}
-                          />
-                        </div>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={preloadLocalModel}
-                        className="w-full py-3 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white border border-violet-500/20 rounded-xl text-xs font-bold transition-all duration-300 shadow-lg shadow-violet-950/30 hover:shadow-violet-900/45 active:scale-[0.97] flex items-center justify-center gap-2 cursor-pointer"
-                      >
-                        <FolderDown className="w-4 h-4" />
-                        Скачать выбранную модель
-                      </button>
-                    )}
-                  </div>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
+                    ИИ-вырезание фона выполняется нативно на устройстве (onnxruntime) и доступно
+                    только в мобильном приложении Android. Соберите APK или скачайте его из релизов.
+                    В браузере работает вырез без ИИ — по цвету фона листа.
+                  </p>
                 </div>
               )}
 
