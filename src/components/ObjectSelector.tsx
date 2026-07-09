@@ -458,9 +458,18 @@ export default function ObjectSelector({
     }
 
     // Подрежим «Контур»: «воздух» вокруг контура — дилатация на даунскейле
-    // (SMART_CONTOUR_BREATHE_PX в полном разрешении)
+    // (SMART_CONTOUR_BREATHE_PX в полном разрешении). ВАЖНО: паддинг расширяется
+    // ТОЛЬКО в фон, не в соседний объект — иначе обводка прихватывает кусок
+    // соседа. Оставляем расширенные пиксели только там, где нет чужого fg
+    // (masks.closed==0 = фон), либо это сама компонента.
     const breatheR = Math.max(1, Math.round(SMART_CONTOUR_BREATHE_PX * s));
-    const smallMask = dilateBinary(tightMask, masks.width, masks.height, breatheR);
+    const breathed = dilateBinary(tightMask, masks.width, masks.height, breatheR);
+    const smallMask = new Uint8Array(breathed.length);
+    for (let p = 0; p < breathed.length; p++) {
+      if (breathed[p] === 1 && (tightMask[p] === 1 || masks.closed[p] === 0)) {
+        smallMask[p] = 1;
+      }
+    }
     const smallBBox: Rect = {
       x: Math.max(0, tightBBox.x - breatheR),
       y: Math.max(0, tightBBox.y - breatheR),

@@ -1116,20 +1116,27 @@ export default function App() {
           const resA = runResults[a];
           if (!resA) continue;
           const rectA = clampedSelections[a].rect;
-          const aArea = rectA.width * rectA.height;
           const innerIdx: number[] = [];
           for (let b = 0; b < clampedSelections.length; b++) {
             if (b === a || !runResults[b]) continue;
-            const rb = clampedSelections[b].rect;
-            const bArea = rb.width * rb.height;
-            // «Вложенный» = БОЛЬШАЯ ЧАСТЬ (>50%) внутри родителя И заметно меньше
-            // его по площади (рамка алмаза у пользователя торчит из рамки короны
-            // на ~треть — пороги 90%/70% это молча пропускали; guard по размеру
-            // не даёт двум соседним крупным рамкам грызть друг друга)
+            const resB = runResults[b]!;
+            // ЛОГИКА ПО ОБЪЕКТУ, А НЕ ПО РАМКЕ: рамка может торчать из родителя
+            // пустым фоном (кейс пользователя: рамка алмаза выступает вниз из
+            // рамки короны, но САМ алмаз целиком внутри). Берём bbox ГОТОВОГО
+            // результата B в координатах листа.
+            const bResultRect: Rect = {
+              x: clampedSelections[b].rect.x + resB.offsetX,
+              y: clampedSelections[b].rect.y + resB.offsetY,
+              width: resB.width,
+              height: resB.height,
+            };
+            const bResArea = bResultRect.width * bResultRect.height;
+            const aResArea = runResults[a]!.width * runResults[a]!.height;
+            // Объект B на ≥80% внутри рамки A и заметно меньше результата A
             if (
-              bArea > 0 &&
-              bArea <= 0.6 * aArea &&
-              rectIntersectionArea(rectA, rb) >= 0.5 * bArea
+              bResArea > 0 &&
+              bResArea <= 0.6 * aResArea &&
+              rectIntersectionArea(rectA, bResultRect) >= 0.8 * bResArea
             ) innerIdx.push(b);
           }
           if (innerIdx.length === 0) continue;
