@@ -31,10 +31,11 @@ interface AssetGalleryProps {
   onRetry: (id: string) => void;
   onRename: (id: string, label: string) => void;
   onBackToSelector: () => void;
-  onOpenInEditor: () => void;
+  /** Открыть готовый ассет в редакторе (ластик/восстановление/кроп/экспорт). */
+  onEdit: (id: string) => void;
 }
 
-/** CSS-шахматка, как в AssetCard (та же техника: 4 linear-gradient по 45°). */
+/** CSS-шахматка под превью ассета (4 linear-gradient по 45°). */
 const CHECKERBOARD_STYLE: React.CSSProperties = {
   backgroundImage:
     'linear-gradient(45deg, #52525b 25%, transparent 25%), linear-gradient(-45deg, #52525b 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #52525b 75%), linear-gradient(-45deg, transparent 75%, #52525b 75%)',
@@ -46,6 +47,9 @@ const sanitizeFileName = (name: string): string => {
   const safe = name.replace(/[\/\\?%*:|"<>\s]+/g, '_').trim();
   return !safe || safe === '_' ? 'asset' : safe;
 };
+
+/** Расширение файла по mime-типу blob'а (после редактора ассет может стать WebP). */
+const blobExt = (blob: Blob): string => (blob.type === 'image/webp' ? 'webp' : 'png');
 
 const blobToDataUrl = (blob: Blob): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -64,7 +68,7 @@ const blobToDataUrl = (blob: Blob): Promise<string> =>
   });
 
 /**
- * Скачивание одного PNG-ассета через общий downloadHelper (native/web).
+ * Скачивание одного ассета (PNG/WebP) через общий downloadHelper (native/web).
  * silent=true — тихий режим для пакетного скачивания (без alert на каждый файл).
  */
 async function downloadAssetBlob(filename: string, blob: Blob, silent = false): Promise<void> {
@@ -85,7 +89,7 @@ export default function AssetGallery({
   onRetry,
   onRename,
   onBackToSelector,
-  onOpenInEditor,
+  onEdit,
 }: AssetGalleryProps) {
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [isDownloadingAll, setIsDownloadingAll] = useState(false);
@@ -98,7 +102,7 @@ export default function AssetGallery({
     if (!asset.blob || downloadingId) return;
     setDownloadingId(asset.id);
     try {
-      await downloadAssetBlob(`${sanitizeFileName(asset.label)}.png`, asset.blob);
+      await downloadAssetBlob(`${sanitizeFileName(asset.label)}.${blobExt(asset.blob)}`, asset.blob);
     } catch (e) {
       console.error('Asset download failed:', e);
       alert('Ошибка при скачивании файла: ' + String(e));
@@ -124,7 +128,7 @@ export default function AssetGallery({
         }
         // По очереди — тем же helper-ом, но в тихом режиме:
         // один итоговый alert вместо N блокирующих диалогов на каждый файл
-        await downloadAssetBlob(`${safeName}.png`, asset.blob, true);
+        await downloadAssetBlob(`${safeName}.${blobExt(asset.blob)}`, asset.blob, true);
         savedCount++;
       }
       if (Capacitor.isNativePlatform() && savedCount > 0) {
@@ -168,15 +172,6 @@ export default function AssetGallery({
             >
               <ArrowLeft className="w-3.5 h-3.5" />
               К выбору объектов
-            </button>
-            <button
-              onClick={onOpenInEditor}
-              disabled={isProcessing}
-              className="flex items-center gap-1.5 py-2.5 px-4 bg-zinc-950/60 hover:bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-xl text-xs font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Открыть оригинальный лист в классическом редакторе нарезки"
-            >
-              <PencilRuler className="w-3.5 h-3.5" />
-              Открыть в редакторе
             </button>
             <button
               onClick={handleDownloadAll}
@@ -284,18 +279,29 @@ export default function AssetGallery({
                   </span>
 
                   {asset.status === 'done' && asset.blob && (
-                    <button
-                      onClick={() => handleDownloadOne(asset)}
-                      disabled={busy}
-                      className="flex items-center gap-1.5 py-2 px-3.5 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:from-zinc-800 disabled:to-zinc-800 disabled:text-zinc-500 text-white rounded-xl text-[11px] font-bold transition-all shadow-md cursor-pointer active:scale-95 disabled:cursor-not-allowed"
-                    >
-                      {downloadingId === asset.id ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <Download className="w-3.5 h-3.5" />
-                      )}
-                      Скачать
-                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => onEdit(asset.id)}
+                        disabled={busy}
+                        className="flex items-center gap-1.5 py-2 px-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 rounded-xl text-[11px] font-bold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="Открыть ассет в редакторе (ластик, восстановление, кроп, формат)"
+                      >
+                        <PencilRuler className="w-3.5 h-3.5" />
+                        Редактировать
+                      </button>
+                      <button
+                        onClick={() => handleDownloadOne(asset)}
+                        disabled={busy}
+                        className="flex items-center gap-1.5 py-2 px-3.5 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:from-zinc-800 disabled:to-zinc-800 disabled:text-zinc-500 text-white rounded-xl text-[11px] font-bold transition-all shadow-md cursor-pointer active:scale-95 disabled:cursor-not-allowed"
+                      >
+                        {downloadingId === asset.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Download className="w-3.5 h-3.5" />
+                        )}
+                        Скачать
+                      </button>
+                    </div>
                   )}
 
                   {asset.status === 'error' && (

@@ -30,13 +30,7 @@ export interface SelectionItem {
   mask?: SelectionMask;
 }
 
-export interface Slice {
-  id: string;
-  rect: Rect;
-  label: string;
-}
-
-/** Готовый ассет нового потока «по объектам»: результат ИИ-вырезания одной рамки. */
+/** Готовый ассет потока «по объектам»: результат ИИ-вырезания одной рамки. */
 export interface ObjectAsset {
   id: string;
   label: string;
@@ -53,47 +47,19 @@ export interface ObjectAsset {
   note?: string;
   /** Индекс выделения в списке последнего прогона — для повтора с тем же контекстом. */
   selectionIndex?: number;
+  /** Смещение обрезанного результата внутри исходной рамки rect (после trim), px. */
+  offsetX?: number;
+  offsetY?: number;
+  /**
+   * Ассет был кадрирован/повёрнут/ресайзнут в редакторе и сохранён:
+   * привязка rect+offset к оригинальному листу потеряна, кисть
+   * «Восстановить» при повторном открытии редактора блокируется.
+   */
+  restoreDisabled?: boolean;
 }
 
 export interface ColorRGB {
   r: number;
   g: number;
   b: number;
-}
-
-export type SVGMode = 'silhouette' | 'color' | 'embedded';
-
-export interface ProcessedAsset {
-  id: string;
-  name: string;
-  rect: Rect;
-  pngDataUrl: string;
-  rasterDataUrl?: string;
-  rasterFormat?: 'webp' | 'png';
-  width: number;
-  height: number;
-  svgMode: SVGMode;
-  svgCode: string;
-  silhouetteSvg: string;
-  colorSvg: string;
-  embeddedSvg: string;
-  dominantColor: string;
-  tags: string[];
-}
-
-export interface AppState {
-  originalImage: string | null; // DataURL of uploaded image
-  imageWidth: number;
-  imageHeight: number;
-  transparentColor: ColorRGB | null;
-  tolerance: number;
-  mergeDistance: number;
-  minSize: number;
-  padding: number;
-  slices: Slice[];
-  selectedSliceId: string | null;
-  processedAssets: ProcessedAsset[];
-  isProcessing: boolean;
-  brushMode: 'none' | 'erase' | 'restore';
-  brushSize: number;
 }

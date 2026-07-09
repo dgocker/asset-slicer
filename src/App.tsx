@@ -4,29 +4,22 @@
  */
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { motion } from 'motion/react';
 import {
-  Layers,
   Scissors,
   Sparkles,
-  ChevronRight,
-  Info,
   Smartphone,
   FolderDown,
-  FileImage,
   Loader2,
   Settings,
   X,
   Trash2
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
-import JSZip from 'jszip';
-import { Slice, ProcessedAsset, ColorRGB, Rect, ObjectAsset, SelectionItem, SelectionMask } from './types';
+import { ColorRGB, Rect, ObjectAsset, SelectionItem, SelectionMask } from './types';
 import ImageUploader from './components/ImageUploader';
-import Workspace from './components/Workspace';
-import AssetCard from './components/AssetCard';
 import ObjectSelector from './components/ObjectSelector';
 import AssetGallery from './components/AssetGallery';
+import AssetEditor from './components/AssetEditor';
 import { BackgroundRemoval } from './plugins/backgroundRemoval';
 import {
   clampRectToBounds,
@@ -111,7 +104,7 @@ const loadImage = (url: string): Promise<HTMLImageElement> => {
 };
 
 /** Экраны приложения (стейт-машина основного потока). */
-type AppView = 'upload' | 'selecting' | 'processing' | 'gallery' | 'legacy-workspace';
+type AppView = 'upload' | 'selecting' | 'processing' | 'gallery';
 
 const TRIM_ALPHA_THRESHOLD = 8;
 const TRIM_MARGIN_PX = 2;
@@ -506,27 +499,19 @@ const revokeAssetUrls = (list: ObjectAsset[]) => {
 };
 
 export default function App() {
-  const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [originalImageSrc, setOriginalImageSrc] = useState<string | null>(null);
-  const [slices, setSlices] = useState<Slice[]>([]);
-  const processedImageDataRef = useRef<ImageData | null>(null);
-  const originalImageDataRef = useRef<ImageData | null>(null);
-  const [dataVersion, setDataVersion] = useState(0);
-  const [keyColor, setKeyColor] = useState<ColorRGB | null>(null);
-  const [assets, setAssets] = useState<{ [id: string]: ProcessedAsset }>({});
-  const [isZipping, setIsZipping] = useState(false);
   const [useAIBgRemoval, setUseAIBgRemoval] = useState(true);
   const [aiProgress, setAiProgress] = useState<string>('Инициализация...');
   const [aiPercent, setAiPercent] = useState<number>(0);
 
   // Стейт-машина экранов основного потока
   const [view, setView] = useState<AppView>('upload');
-  const [initialSlices, setInitialSlices] = useState<Slice[] | null>(null);
-  const pendingFileRef = useRef<File | null>(null);
 
   // Новый поток «по объектам»: готовые ассеты галереи + сохранённые выделения
   // (для возврата из галереи на экран выбора объектов и для повтора одного объекта)
   const [objectAssets, setObjectAssets] = useState<ObjectAsset[]>([]);
+  // ID ассета, открытого в полноэкранном редакторе (поверх галереи)
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
   const [savedSelections, setSavedSelections] = useState<SelectionItem[] | null>(null);
   const savedSelectionsRef = useRef<SelectionItem[] | null>(null);
   // Опция «Исключать вложенные рамки» последнего прогона — для retry с тем же контекстом
@@ -570,6 +555,7 @@ export default function App() {
     revokeAssetUrls(objectAssetsRef.current);
     objectAssetsRef.current = [];
     setObjectAssets([]);
+    setEditingAssetId(null);
   }, []);
 
   useEffect(() => {
@@ -582,6 +568,9 @@ export default function App() {
   
   // Native and AI Settings State
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  // Модалка подтверждения очистки кэша моделей (ввод «УДАЛИТЬ»)
+  const [isClearCacheOpen, setIsClearCacheOpen] = useState(false);
+  const [clearCacheInput, setClearCacheInput] = useState('');
   const [localModel, setLocalModel] = useState<string>(() => {
     return localStorage.getItem('localModel') || 'isnet_quint8';
   });
@@ -639,6 +628,7 @@ export default function App() {
     try {
       const res = await BackgroundRemoval.clearCachedModels();
       setIsCustomModelCached(false);
+      await checkCustomModelCacheStatus();
       alert(`Кэш очищен. Удалено файлов моделей: ${res.deletedCount}`);
     } catch (e) {
       alert('Ошибка при очистке кэша: ' + String(e));
@@ -650,6 +640,20 @@ export default function App() {
       checkCustomModelCacheStatus();
     }
   }, [isSettingsOpen, customModelUrl, checkCustomModelCacheStatus]);
+
+  // Статусы кэша нужны и на главной (список моделей): обновляем на native
+  useEffect(() => {
+    if (view === 'upload') {
+      checkCustomModelCacheStatus();
+    }
+  }, [view, checkCustomModelCacheStatus]);
+
+  /** Выбор модели из списка на главной — тот же эффект, что тап в настройках. */
+  const handleSelectModel = useCallback((url: string) => {
+    setCustomModelUrl(url);
+    localStorage.setItem('customModelUrl', url);
+    checkCustomModelCacheStatus(url);
+  }, [checkCustomModelCacheStatus]);
 
   /**
    * Гарантирует, что нативная модель скачана и закэширована.
@@ -722,7 +726,7 @@ export default function App() {
     setView(originalImageSrc ? 'selecting' : 'upload');
   }, [originalImageSrc]);
 
-  /** Загрузка нового файла: показываем экран выбора объектов (если включён ИИ). */
+  /** Загрузка нового файла: показываем экран выбора объектов. */
   const handleImageSelected = useCallback(async (file: File) => {
     imageLoadRequestIdRef.current++;
 
@@ -736,120 +740,11 @@ export default function App() {
 
     const dataUrl = registerBlobUrl(URL.createObjectURL(file));
     setOriginalImageSrc(dataUrl);
-    setInitialSlices(null);
-    setAssets({});
-
-    if (!useAIBgRemoval) {
-      pendingFileRef.current = null;
-      setImageSrc(dataUrl);
-      setAiPercent(0);
-      setView('legacy-workspace');
-      return;
-    }
 
     // Перед ИИ-обработкой пользователь выбирает объекты на листе
-    pendingFileRef.current = file;
-    setImageSrc(null);
     setAiPercent(0);
     setView('selecting');
-  }, [useAIBgRemoval, clearObjectAssets]);
-
-  /** Старый путь: ИИ-обработка целого листа одним изображением. */
-  const processWholeSheet = useCallback(async () => {
-    const file = pendingFileRef.current;
-    const dataUrl = originalImageSrc;
-    if (!file || !dataUrl) return;
-
-    const requestId = ++imageLoadRequestIdRef.current;
-    setView('processing');
-    setAiProgress('Инициализация ИИ...');
-    setAiPercent(10);
-
-    try {
-      if (Capacitor.isNativePlatform()) {
-        await ensureModelReady();
-        if (requestId !== imageLoadRequestIdRef.current) return;
-
-        setAiProgress('Конвертация изображения...');
-        setAiPercent(20);
-        const fileToDataURL = (f: File): Promise<string> => {
-          return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => {
-              reader.onload = null;
-              reader.onerror = null;
-              resolve(reader.result as string);
-            };
-            reader.onerror = (err) => {
-              reader.onload = null;
-              reader.onerror = null;
-              reject(err);
-            };
-            reader.readAsDataURL(f);
-          });
-        };
-        const fileOrBase64 = await fileToDataURL(file);
-
-        if (requestId !== imageLoadRequestIdRef.current) return;
-
-        setAiProgress('Обработка на устройстве...');
-        setAiPercent(60);
-
-        const result = await BackgroundRemoval.removeBackground({ image: fileOrBase64, url: customModelUrl });
-
-        if (requestId !== imageLoadRequestIdRef.current) return;
-
-        setAiProgress('Завершение...');
-        setAiPercent(90);
-
-        const transparentUrl = Capacitor.convertFileSrc(result.uri);
-        setImageSrc(transparentUrl);
-        setAiPercent(100);
-      } else {
-        const { removeBackground } = await import('@imgly/background-removal');
-        
-        const resultBlob = await removeBackground(file, {
-          model: localModel as any,
-          publicPath: modelDownloadUrl,
-          progress: (key, current, total) => {
-            if (requestId !== imageLoadRequestIdRef.current) return;
-            let percent = 0;
-            if (total && !isNaN(total) && total > 0) {
-              percent = Math.round((current / total) * 100);
-            } else if (current > 0) {
-              percent = Math.min(95, Math.round(current / (1024 * 1024)));
-            }
-            const displayPercent = Math.min(100, Math.max(0, percent));
-            setAiProgress(`Загрузка ИИ: ${displayPercent}%`);
-            setAiPercent(displayPercent);
-          }
-        });
-        
-        if (requestId !== imageLoadRequestIdRef.current) return;
-        
-        const transparentUrl = registerBlobUrl(URL.createObjectURL(resultBlob));
-        setImageSrc(transparentUrl);
-        setAiPercent(100);
-      }
-    } catch (error: any) {
-      if (requestId !== imageLoadRequestIdRef.current) return;
-      console.error("Local AI Background Removal failed:", error);
-      const errMsg = error?.message || String(error);
-      if (errMsg.includes("Model not preloaded")) {
-        alert("Модель ИИ не загружена. Пожалуйста, откройте настройки и скачайте модель.");
-      } else {
-        alert("Локальное удаление фона не удалось: " + errMsg);
-      }
-      setImageSrc(dataUrl);
-    } finally {
-      if (requestId === imageLoadRequestIdRef.current) {
-        setAiPercent(0);
-        setAssets({});
-        // И успех, и фолбэк из catch показывают легаси-Workspace
-        setView('legacy-workspace');
-      }
-    }
-  }, [originalImageSrc, localModel, modelDownloadUrl, customModelUrl, ensureModelReady]);
+  }, [clearObjectAssets]);
 
   /**
    * Кэш ИИ-результата по РЕГИОНУ (bbox всех выделений, ступень 2.5 фолбэка):
@@ -970,53 +865,58 @@ export default function App() {
       return sub;
     };
 
-    // --- Шаг 1: ИИ по исходной рамке ---
-    const cropCanvas = cropToCanvas(img, rect);
-    const rawBlob = await runAIOnCanvas(cropCanvas);
-    const aiCanvas = await blobToSizedCanvas(rawBlob, cropCanvas.width, cropCanvas.height);
-    // Чистый ИИ-результат — в кэш прогона (ступень 2.4 для вложенных рамок);
-    // клон, т.к. finalize мутирует канвас маской «умного» выделения
-    aiResultCacheRef.current.push({ rect, canvas: cloneCanvas(aiCanvas) });
-    if (aiResultCacheRef.current.length > 8) aiResultCacheRef.current.shift();
-    let result = await finalizeCanvas(aiCanvas, true);
-    if (result) return result;
-
-    // --- Шаг 2: ретрай с контекстом — рамка ×1.6 от центра ---
-    const expanded = expandRectFromCenter(rect, 1.6, img.naturalWidth, img.naturalHeight);
-    if (expanded.width > rect.width || expanded.height > rect.height) {
-      const expCrop = cropToCanvas(img, expanded);
-      const expRaw = await runAIOnCanvas(expCrop);
-      const expCanvas = await blobToSizedCanvas(expRaw, expCrop.width, expCrop.height);
-      result = await finalizeCanvas(cutRectFrom(expCanvas, expanded), true);
+    // Тумблер «Авто-удаление фона через AI» выключен — весь ИИ-конвейер
+    // (шаги 1–2.5, включая скачивание модели) пропускается: сразу вырез
+    // по цвету фона листа (шаг 3).
+    if (useAIBgRemoval) {
+      // --- Шаг 1: ИИ по исходной рамке ---
+      const cropCanvas = cropToCanvas(img, rect);
+      const rawBlob = await runAIOnCanvas(cropCanvas);
+      const aiCanvas = await blobToSizedCanvas(rawBlob, cropCanvas.width, cropCanvas.height);
+      // Чистый ИИ-результат — в кэш прогона (ступень 2.4 для вложенных рамок);
+      // клон, т.к. finalize мутирует канвас маской «умного» выделения
+      aiResultCacheRef.current.push({ rect, canvas: cloneCanvas(aiCanvas) });
+      if (aiResultCacheRef.current.length > 8) aiResultCacheRef.current.shift();
+      let result = await finalizeCanvas(aiCanvas, true);
       if (result) return result;
-    }
 
-    // --- Шаг 2.4: объект из ГОТОВОГО ИИ-результата охватывающей рамки ---
-    // (кейс: алмаз невидим моделью в своём кропе, но идеально вырезан в
-    // составе рамки короны, обработанной раньше)
-    const rectArea = rect.width * rect.height;
-    for (const entry of aiResultCacheRef.current) {
-      if (entry.rect === rect) continue;
-      if (rectIntersectionArea(entry.rect, rect) < 0.98 * rectArea) continue;
-      result = await finalizeCanvas(cutRectFrom(entry.canvas, entry.rect), true);
-      if (result) return result;
-    }
+      // --- Шаг 2: ретрай с контекстом — рамка ×1.6 от центра ---
+      const expanded = expandRectFromCenter(rect, 1.6, img.naturalWidth, img.naturalHeight);
+      if (expanded.width > rect.width || expanded.height > rect.height) {
+        const expCrop = cropToCanvas(img, expanded);
+        const expRaw = await runAIOnCanvas(expCrop);
+        const expCanvas = await blobToSizedCanvas(expRaw, expCrop.width, expCrop.height);
+        result = await finalizeCanvas(cutRectFrom(expCanvas, expanded), true);
+        if (result) return result;
+      }
 
-    // --- Шаг 2.5: ИИ по региону всех выделений (кэш) — модель видит объект в
-    // композиции; регион вместо целого листа, чтобы поля не съедали масштаб ---
-    try {
-      const region = unionRectOf(
-        allSelections.map(s => s.rect),
-        24,
-        img.naturalWidth,
-        img.naturalHeight
-      );
-      const { region: srcRect, canvas: regionCanvas } = await getRegionAICanvas(img, region);
-      result = await finalizeCanvas(cutRectFrom(regionCanvas, srcRect), true);
-      if (result) return result;
-    } catch (e) {
-      // регион слишком большой / ИИ упал — тихо падаем на цветовой фолбэк
-      console.warn('Region AI fallback failed:', e);
+      // --- Шаг 2.4: объект из ГОТОВОГО ИИ-результата охватывающей рамки ---
+      // (кейс: алмаз невидим моделью в своём кропе, но идеально вырезан в
+      // составе рамки короны, обработанной раньше)
+      const rectArea = rect.width * rect.height;
+      for (const entry of aiResultCacheRef.current) {
+        if (entry.rect === rect) continue;
+        if (rectIntersectionArea(entry.rect, rect) < 0.98 * rectArea) continue;
+        result = await finalizeCanvas(cutRectFrom(entry.canvas, entry.rect), true);
+        if (result) return result;
+      }
+
+      // --- Шаг 2.5: ИИ по региону всех выделений (кэш) — модель видит объект в
+      // композиции; регион вместо целого листа, чтобы поля не съедали масштаб ---
+      try {
+        const region = unionRectOf(
+          allSelections.map(s => s.rect),
+          24,
+          img.naturalWidth,
+          img.naturalHeight
+        );
+        const { region: srcRect, canvas: regionCanvas } = await getRegionAICanvas(img, region);
+        result = await finalizeCanvas(cutRectFrom(regionCanvas, srcRect), true);
+        if (result) return result;
+      } catch (e) {
+        // регион слишком большой / ИИ упал — тихо падаем на цветовой фолбэк
+        console.warn('Region AI fallback failed:', e);
+      }
     }
 
     // --- Шаг 3: вырез БЕЗ ИИ по цвету фона листа ---
@@ -1067,13 +967,18 @@ export default function App() {
       colorCtx.putImageData(colorData, 0, 0);
       const colorResult = await trimCanvasTransparent(colorCanvas);
       if (colorResult) {
-        return { ...colorResult, note: 'ИИ не нашёл объект — вырезано по цвету фона' };
+        // При выключенном ИИ вырез по цвету — штатный путь, пометка не нужна
+        return useAIBgRemoval
+          ? { ...colorResult, note: 'ИИ не нашёл объект — вырезано по цвету фона' }
+          : colorResult;
       }
     }
 
     // --- Шаг 4: всё пусто ---
-    throw new Error('ИИ вернул пустой результат');
-  }, [runAIOnCanvas, getRegionAICanvas]);
+    throw new Error(
+      useAIBgRemoval ? 'ИИ вернул пустой результат' : 'Объект не найден по цвету фона'
+    );
+  }, [useAIBgRemoval, runAIOnCanvas, getRegionAICanvas]);
 
   /**
    * Новый основной поток «по объектам»: каждая рамка вырезается отдельным
@@ -1083,7 +988,7 @@ export default function App() {
    */
   const processObjects = useCallback(async (
     selections: SelectionItem[],
-    options: { excludeNested: boolean }
+    options: { excludeNested: boolean; labels?: string[] }
   ) => {
     const dataUrl = originalImageSrc;
     if (!dataUrl || selections.length === 0) return;
@@ -1094,7 +999,9 @@ export default function App() {
     setAiPercent(0);
 
     try {
-      if (Capacitor.isNativePlatform()) {
+      // Модель нужна только при включённом ИИ — с выключенным тумблером
+      // ничего не скачиваем (вырез идёт по цвету фона)
+      if (Capacitor.isNativePlatform() && useAIBgRemoval) {
         await ensureModelReady();
         if (requestId !== imageLoadRequestIdRef.current) return;
       }
@@ -1124,7 +1031,7 @@ export default function App() {
       const stamp = Date.now();
       const pendingAssets: ObjectAsset[] = clampedSelections.map((sel, i) => ({
         id: `obj-${stamp}-${i}`,
-        label: `Объект ${i + 1}`,
+        label: options.labels?.[i] ?? `Объект ${i + 1}`,
         rect: sel.rect,
         blob: null,
         displayUrl: null,
@@ -1171,6 +1078,8 @@ export default function App() {
                   displayUrl: res.displayUrl,
                   width: res.width,
                   height: res.height,
+                  offsetX: res.offsetX,
+                  offsetY: res.offsetY,
                   status: 'done' as const,
                   error: undefined,
                   note: res.note,
@@ -1266,15 +1175,25 @@ export default function App() {
             if (!trimmed) continue;
             const assetId = pendingAssets[a].id;
             try { URL.revokeObjectURL(resA.displayUrl); } catch (e) {}
+            const newOffsetX = resA.offsetX + trimmed.offsetX;
+            const newOffsetY = resA.offsetY + trimmed.offsetY;
             runResults[a] = {
               ...trimmed,
-              offsetX: resA.offsetX + trimmed.offsetX,
-              offsetY: resA.offsetY + trimmed.offsetY,
+              offsetX: newOffsetX,
+              offsetY: newOffsetY,
               note: resA.note,
             };
             setObjectAssets(prev => prev.map(x =>
               x.id === assetId
-                ? { ...x, blob: trimmed.blob, displayUrl: trimmed.displayUrl, width: trimmed.width, height: trimmed.height }
+                ? {
+                    ...x,
+                    blob: trimmed.blob,
+                    displayUrl: trimmed.displayUrl,
+                    width: trimmed.width,
+                    height: trimmed.height,
+                    offsetX: newOffsetX,
+                    offsetY: newOffsetY,
+                  }
                 : x
             ));
           } catch (e) {
@@ -1301,7 +1220,28 @@ export default function App() {
         setAiPercent(0);
       }
     }
-  }, [originalImageSrc, ensureModelReady, processOneSelection]);
+  }, [originalImageSrc, useAIBgRemoval, ensureModelReady, processOneSelection]);
+
+  /**
+   * «Весь лист (без нарезки)»: лист обрабатывается через общий конвейер
+   * как ОДИН объект (рамка на весь лист) и появляется единственной
+   * карточкой галереи с подписью «Весь лист».
+   */
+  const processWholeSheet = useCallback(async () => {
+    const dataUrl = originalImageSrc;
+    if (!dataUrl) return;
+    try {
+      const img = await loadImage(dataUrl);
+      await processObjects(
+        [{ rect: { x: 0, y: 0, width: img.naturalWidth, height: img.naturalHeight } }],
+        { excludeNested: false, labels: ['Весь лист'] }
+      );
+    } catch (error: any) {
+      console.error('Whole-sheet processing failed:', error);
+      alert('Обработка листа не удалась: ' + (error?.message || String(error)));
+      setView('selecting');
+    }
+  }, [originalImageSrc, processObjects]);
 
   /** Повторный ИИ-прогон одной упавшей рамки из галереи. */
   const retryObjectAsset = useCallback(async (assetId: string) => {
@@ -1321,7 +1261,7 @@ export default function App() {
     ));
 
     try {
-      if (Capacitor.isNativePlatform()) {
+      if (Capacitor.isNativePlatform() && useAIBgRemoval) {
         await ensureModelReady();
         if (requestId !== imageLoadRequestIdRef.current) return;
       }
@@ -1365,6 +1305,10 @@ export default function App() {
               displayUrl: res.displayUrl,
               width: res.width,
               height: res.height,
+              offsetX: res.offsetX,
+              offsetY: res.offsetY,
+              // Свежий результат конвейера: привязка к листу снова валидна
+              restoreDisabled: false,
               status: 'done' as const,
               error: undefined,
               note: res.note,
@@ -1381,12 +1325,44 @@ export default function App() {
           : a
       ));
     }
-  }, [originalImageSrc, ensureModelReady, processOneSelection]);
+  }, [originalImageSrc, useAIBgRemoval, ensureModelReady, processOneSelection]);
 
   /** Переименование ассета в галерее (имя файла при скачивании). */
   const renameObjectAsset = useCallback((assetId: string, label: string) => {
     setObjectAssets(prev => prev.map(a => (a.id === assetId ? { ...a, label } : a)));
   }, []);
+
+  /**
+   * Сохранение из редактора: подменяем blob/displayUrl/размеры карточки
+   * (старый objectURL освобождаем). offsetX/offsetY сохраняются для стирания
+   * ластиком (пиксели не двигались), но если ассет был кадрирован/повёрнут/
+   * ресайзнут (result.transformed) — привязка rect+offset к листу потеряна:
+   * ставим restoreDisabled, чтобы при повторном открытии редактора кисть
+   * «Восстановить» не рисовала смещённые/чужие пиксели оригинала.
+   */
+  const handleEditorSave = useCallback(
+    (
+      assetId: string,
+      result: { blob: Blob; displayUrl: string; width: number; height: number; transformed: boolean }
+    ) => {
+      setObjectAssets(prev => prev.map(a => {
+        if (a.id !== assetId) return a;
+        if (a.displayUrl && a.displayUrl !== result.displayUrl) {
+          try { URL.revokeObjectURL(a.displayUrl); } catch (e) {}
+        }
+        return {
+          ...a,
+          blob: result.blob,
+          displayUrl: result.displayUrl,
+          width: result.width,
+          height: result.height,
+          restoreDisabled: a.restoreDisabled || result.transformed,
+        };
+      }));
+      setEditingAssetId(null);
+    },
+    []
+  );
 
   /** «← К выбору объектов»: назад в селектор с сохранёнными рамками. */
   const handleBackToSelector = useCallback(() => {
@@ -1394,111 +1370,15 @@ export default function App() {
     setView('selecting');
   }, [clearObjectAssets]);
 
-  /** «Открыть в редакторе»: легаси-Workspace с оригинальным листом. */
-  const handleOpenInEditor = useCallback(() => {
-    if (!originalImageSrc) return;
-    clearObjectAssets();
-    setInitialSlices(null);
-    setImageSrc(originalImageSrc);
-    setView('legacy-workspace');
-  }, [originalImageSrc, clearObjectAssets]);
-
-  const handleSlicesUpdated = useCallback((newSlices: Slice[], imgData: ImageData, origData?: ImageData, kColor?: ColorRGB) => {
-    setSlices(newSlices);
-    processedImageDataRef.current = imgData;
-    if (origData) {
-      originalImageDataRef.current = origData;
-    }
-    if (kColor) {
-      setKeyColor(kColor);
-    } else {
-      setKeyColor(null);
-    }
-    setDataVersion(v => v + 1);
-  }, []);
-
-  const handleAssetUpdated = useCallback((asset: ProcessedAsset) => {
-    setAssets(prev => ({
-      ...prev,
-      [asset.id]: asset
-    }));
-  }, []);
-
   const handleReset = useCallback(() => {
     imageLoadRequestIdRef.current++;
     clearObjectAssets();
     setSavedSelections(null);
     savedSelectionsRef.current = null;
     revokeAllBlobs();
-    pendingFileRef.current = null;
-    setInitialSlices(null);
-    setImageSrc(null);
     setOriginalImageSrc(null);
-    setSlices([]);
-    processedImageDataRef.current = null;
-    originalImageDataRef.current = null;
-    setKeyColor(null);
-    setAssets({});
-    setDataVersion(0);
     setView('upload');
   }, [clearObjectAssets]);
-
-  // Triggers zipping and downloading all active assets in a single structured file
-  const handleDownloadAll = async () => {
-    const activeAssets = (Object.values(assets) as ProcessedAsset[]).filter(asset =>
-      slices.some(s => s.id === asset.id)
-    );
-    if (activeAssets.length === 0) return;
-
-    setIsZipping(true);
-    try {
-      const zip = new JSZip();
-
-      const nameCounts: Record<string, number> = {};
-      activeAssets.forEach(asset => {
-        // Sanitize name: remove path traversal, filesystem wildcards, replace slashes
-        let safeName = asset.name.replace(/[\/\\?%*:|"<>\s]+/g, '_').trim();
-        if (!safeName || safeName === '_') {
-          safeName = 'asset';
-        }
-        
-        // Prevent naming collisions
-        if (nameCounts[safeName] !== undefined) {
-          nameCounts[safeName]++;
-          safeName = `${safeName}_${nameCounts[safeName]}`;
-        } else {
-          nameCounts[safeName] = 1;
-        }
-
-        // 1. Add SVG files to root
-        zip.file(`${safeName}.svg`, asset.svgCode);
-
-        // 2. Add compressed/configured raster files to a format-named subfolder
-        const rasterUrl = asset.rasterDataUrl || asset.pngDataUrl;
-        const format = asset.rasterFormat || 'png';
-        if (rasterUrl && rasterUrl.includes(',')) {
-          const base64Content = rasterUrl.split(',')[1];
-          zip.file(`${format}/${safeName}.${format}`, base64Content, { base64: true });
-        }
-      });
-
-      const zipFilename = `sliced_assets_${Date.now()}.zip`;
-      const { downloadBinaryFile } = await import('./utils/downloadHelper');
-
-      if (Capacitor.isNativePlatform()) {
-        const base64Content = await zip.generateAsync({ type: 'base64' });
-        await downloadBinaryFile(zipFilename, base64Content);
-      } else {
-        const content = await zip.generateAsync({ type: 'blob' });
-        await downloadBinaryFile(zipFilename, '', content);
-      }
-    } catch (err) {
-      console.error('Failed to create ZIP archive:', err);
-      alert('Ошибка создания ZIP-архива: ' + String(err));
-    } finally {
-      setIsZipping(false);
-    }
-  };
 
   const preloadLocalModel = async () => {
     setIsModelDownloading(true);
@@ -1576,7 +1456,12 @@ export default function App() {
     }
   };
 
-  const activeAssetsCount = slices.filter(s => !!assets[s.id]).length;
+  // Ассет, открытый в редакторе (только готовый, с blob)
+  const editingAsset = editingAssetId
+    ? objectAssets.find(a => a.id === editingAssetId && a.status === 'done' && a.blob) ?? null
+    : null;
+
+  const clearCacheConfirmed = clearCacheInput.trim().toUpperCase() === 'УДАЛИТЬ';
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-violet-500/30 selection:text-violet-250">
@@ -1590,24 +1475,16 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-extrabold text-zinc-100 text-sm sm:text-base leading-tight tracking-tight">
-                Нарезка и Векторизация
+                Нарезка ассетов
               </h1>
               <p className="text-[10px] text-zinc-400 font-semibold tracking-wider uppercase">
-                Asset Slicer & SVG Vectorizer
+                AI ASSET CUTTER
               </p>
             </div>
           </div>
 
           {/* Actions & Stats */}
           <div className="flex items-center gap-3">
-            {imageSrc && (
-              <div className="flex items-center gap-2 bg-zinc-950/60 border border-zinc-800/60 rounded-full px-4 py-1.5 text-xs shadow-inner">
-                <Smartphone className="w-3.5 h-3.5 text-violet-400" />
-                <span className="text-zinc-400 font-medium hidden sm:inline">Готово для телефона:</span>
-                <span className="text-emerald-400 font-bold font-mono">{slices.length} объектов</span>
-              </div>
-            )}
-            
             <button
               onClick={() => setIsSettingsOpen(true)}
               className="p-2.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/80 border border-zinc-800/50 hover:border-zinc-700/80 rounded-2xl transition-all duration-300 shadow-md active:scale-95 cursor-pointer"
@@ -1652,7 +1529,7 @@ export default function App() {
               <p className="text-zinc-400 text-sm max-w-xs text-center leading-relaxed">
                 {modelFetchInfo
                   ? 'Модель ИИ скачивается на устройство. Прерванная загрузка продолжится с того же места (докачка).'
-                  : 'Локальная нейросеть вырезает фон прямо в вашем браузере. Это абсолютно безопасно и работает офлайн.'}
+                  : 'Локальная нейросеть вырезает фон прямо на устройстве, офлайн. Изображения никуда не отправляются.'}
               </p>
               <button
                 onClick={handleCancelProcessing}
@@ -1682,9 +1559,9 @@ export default function App() {
               onRetry={retryObjectAsset}
               onRename={renameObjectAsset}
               onBackToSelector={handleBackToSelector}
-              onOpenInEditor={handleOpenInEditor}
+              onEdit={setEditingAssetId}
             />
-          ) : view !== 'legacy-workspace' || !imageSrc ? (
+          ) : (
             /* Upload State */
             <div
               key="uploader-view"
@@ -1697,10 +1574,10 @@ export default function App() {
                   Оптимизировано для мобильных телефонов
                 </div>
                 <h2 className="text-2xl sm:text-4xl font-extrabold text-white tracking-tight leading-tight px-4 bg-clip-text bg-gradient-to-b from-white to-zinc-300">
-                  Вырезайте ассеты, удаляйте фон и конвертируйте в SVG за секунды
+                  Вырезайте ассеты из любого листа за секунды
                 </h2>
                 <p className="text-zinc-400 text-sm sm:text-base mt-3.5 px-6 leading-relaxed max-w-xl mx-auto">
-                  Загрузите любое изображение, логотип или коллаж графики. Приложение автоматически разделит его на прозрачные, аккуратно кадрированные векторные файлы.
+                  Загрузите лист с иконками, логотипами или графикой — ИИ вырежет каждый объект отдельно, с прозрачным фоном и аккуратной обрезкой.
                 </p>
               </div>
 
@@ -1709,8 +1586,12 @@ export default function App() {
                 onImageSelected={handleImageSelected}
                 useAIBgRemoval={useAIBgRemoval}
                 onUseAIBgRemovalChange={setUseAIBgRemoval}
-                localModel={localModel}
+                modelsList={modelsList}
+                customModelUrl={customModelUrl}
+                cacheStatuses={cacheStatuses}
+                onSelectModel={handleSelectModel}
                 onOpenSettings={() => setIsSettingsOpen(true)}
+                showModelList={Capacitor.isNativePlatform()}
               />
 
               {/* Explanatory visual step-by-step footer */}
@@ -1718,109 +1599,24 @@ export default function App() {
                 <div className="flex items-start gap-3 bg-zinc-900/20 border border-zinc-900/50 rounded-2xl p-4">
                   <div className="w-7 h-7 rounded-full bg-zinc-900 text-violet-400 border border-zinc-800 font-bold text-xs flex items-center justify-center shrink-0 shadow-inner">1</div>
                   <div>
-                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Загрузка листа</h5>
-                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">Сделайте фото на камеру или выберите картинку с иконками.</p>
+                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Загрузите лист</h5>
+                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">Сделайте фото или выберите картинку с объектами из галереи.</p>
                   </div>
                 </div>
                 <div className="flex items-start gap-3 bg-zinc-900/20 border border-zinc-900/50 rounded-2xl p-4">
                   <div className="w-7 h-7 rounded-full bg-zinc-900 text-violet-400 border border-zinc-800 font-bold text-xs flex items-center justify-center shrink-0 shadow-inner">2</div>
                   <div>
-                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Авто-нарезка и чистка</h5>
-                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">Фон становится прозрачным. Объекты нарезаются в отдельные рамки.</p>
+                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Выберите объекты</h5>
+                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">Авто-детекция, вручную или умное выделение — как удобнее.</p>
                   </div>
                 </div>
                 <div className="flex items-start gap-3 bg-zinc-900/20 border border-zinc-900/50 rounded-2xl p-4">
                   <div className="w-7 h-7 rounded-full bg-zinc-900 text-violet-400 border border-zinc-800 font-bold text-xs flex items-center justify-center shrink-0 shadow-inner">3</div>
                   <div>
-                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Векторный SVG экспорт</h5>
-                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">Получите чистые SVG файлы или скопируйте код прямо в разметку.</p>
+                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Скачайте результат</h5>
+                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">ИИ вырежет каждый объект отдельно — скачайте PNG или WebP.</p>
                   </div>
                 </div>
-              </div>
-
-            </div>
-          ) : (
-            /* Active Workspace State */
-            <div
-              key="workspace-view"
-              className="flex flex-col gap-8 animate-in fade-in slide-in-from-bottom-4 duration-500"
-            >
-
-              {/* Workspace Board */}
-              <Workspace
-                imageSrc={originalImageSrc || imageSrc!}
-                aiImageSrc={useAIBgRemoval && imageSrc !== originalImageSrc ? imageSrc : null}
-                initialSlices={initialSlices}
-                onSlicesUpdated={handleSlicesUpdated}
-                onReset={handleReset}
-              />
-
-              {/* Sliced Output Result Assets Area */}
-              <div id="results-section" className="w-full border-t border-zinc-800/80 pt-10 pb-16">
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-8">
-                  <div>
-                    <h3 className="font-extrabold text-zinc-100 text-lg sm:text-xl flex items-center gap-2.5">
-                      <Layers className="w-5.5 h-5.5 text-violet-400" />
-                      Результаты нарезки ассетов
-                    </h3>
-                    <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-                      Каждый выделенный объект вырезан с прозрачным фоном и готов к загрузке в SVG формате.
-                    </p>
-                  </div>
-
-                  {/* Batch Actions */}
-                  {activeAssetsCount > 0 && (
-                    <div className="flex flex-col sm:flex-row gap-3 w-full sm:w-auto">
-                      <button
-                        id="btn-download-all"
-                        onClick={handleDownloadAll}
-                        disabled={isZipping}
-                        className="flex items-center gap-2 py-3 px-6 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:from-zinc-850 disabled:to-zinc-850 text-white rounded-2xl font-bold text-xs transition-all duration-300 shadow-[0_4px_12px_rgba(124,58,237,0.25)] hover:shadow-[0_4px_20px_rgba(124,58,237,0.4)] active:scale-95 w-full sm:w-auto justify-center cursor-pointer"
-                      >
-                        {isZipping ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Создание ZIP архива...
-                          </>
-                        ) : (
-                          <>
-                            <FolderDown className="w-4 h-4" />
-                            Скачать все ассеты в ZIP-архиве
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  )}
-                </div>
-
-                {/* Grid Lists of Assets */}
-                {slices.length === 0 ? (
-                  <div className="w-full bg-zinc-900/30 border border-zinc-800/80 rounded-3xl p-12 text-center flex flex-col items-center justify-center shadow-lg relative overflow-hidden">
-                    <div className="absolute inset-0 bg-gradient-to-tr from-violet-500/5 via-transparent to-transparent pointer-events-none" />
-                    <div className="w-14 h-14 bg-zinc-900/80 rounded-2xl flex items-center justify-center border border-zinc-800 mb-4 text-zinc-400 shadow-md">
-                      <Info className="w-6 h-6 text-zinc-400" />
-                    </div>
-                    <h5 className="font-bold text-zinc-200 text-sm sm:text-base mb-2">
-                      Объекты не обнаружены
-                    </h5>
-                    <p className="text-xs text-zinc-400 max-w-md leading-relaxed">
-                      Попробуйте отрегулировать допуск цвета фона во вкладке **Фон**, уменьшить **Размер объекта** или обведите границы нужного элемента вручную в режиме **Выделение**.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="flex flex-col gap-6">
-                    {processedImageDataRef.current && slices.map(slice => (
-                      <AssetCard
-                        key={slice.id}
-                        slice={slice}
-                        processedImageData={processedImageDataRef.current!}
-                        originalImageData={originalImageDataRef.current}
-                        keyColor={keyColor}
-                        onAssetUpdated={handleAssetUpdated}
-                      />
-                    ))}
-                  </div>
-                )}
               </div>
 
             </div>
@@ -1828,10 +1624,30 @@ export default function App() {
 
       </main>
 
+      {/* Fullscreen Asset Editor (modally over the gallery) */}
+      {editingAsset && editingAsset.blob && originalImageSrc && (
+        <AssetEditor
+          asset={{
+            id: editingAsset.id,
+            label: editingAsset.label,
+            rect: editingAsset.rect,
+            blob: editingAsset.blob,
+            width: editingAsset.width,
+            height: editingAsset.height,
+            offsetX: editingAsset.offsetX,
+            offsetY: editingAsset.offsetY,
+            restoreDisabled: editingAsset.restoreDisabled,
+          }}
+          originalImageSrc={originalImageSrc}
+          onSave={handleEditorSave}
+          onClose={() => setEditingAssetId(null)}
+        />
+      )}
+
       {/* Clean Mobile-friendly footer */}
       <footer className="w-full border-t border-zinc-900 bg-zinc-950 py-8 mt-auto text-center text-zinc-550 text-xs px-4">
         <p className="font-medium tracking-wide">
-          Asset Slicer & SVG Vectorizer — Удобное кадрирование и векторизация графики прямо с мобильного телефона.
+          Asset Slicer — ИИ-вырезание объектов из любого изображения прямо с телефона.
         </p>
       </footer>
 
@@ -2051,7 +1867,10 @@ export default function App() {
                     {/* Cache Actions */}
                     <div className="pt-1 flex justify-between gap-3">
                       <button
-                        onClick={clearCustomModelCache}
+                        onClick={() => {
+                          setClearCacheInput('');
+                          setIsClearCacheOpen(true);
+                        }}
                         className="flex-1 py-2.5 px-3 bg-red-950/15 hover:bg-red-950/30 border border-red-900/30 hover:border-red-800/40 rounded-xl text-[10px] font-bold uppercase tracking-wider text-red-400 hover:text-red-350 transition-all duration-250 cursor-pointer active:scale-[0.97] shadow-sm"
                       >
                         Очистить кэш
@@ -2079,7 +1898,7 @@ export default function App() {
                   
                   <div className="flex items-center gap-2">
                     <Sparkles className="w-4 h-4 text-violet-400" />
-                    <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">Модель ИИ (Браузерная версия)</label>
+                    <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">Модель ИИ (веб-версия)</label>
                   </div>
 
                   <div className="grid grid-cols-1 gap-3">
@@ -2217,7 +2036,7 @@ export default function App() {
                     className="w-full bg-zinc-950/60 border border-zinc-850 hover:border-zinc-750 focus:border-violet-500/80 focus:ring-[3px] focus:ring-violet-500/10 rounded-xl px-4 py-2.5 text-xs text-zinc-200 placeholder-zinc-650 transition-all duration-300 outline-none"
                   />
                   <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                    Все ассеты (картинки, SVG и ZIP-архивы) сохраняются в указанную подпапку Android-директории <code className="text-violet-450 font-mono text-[10px] bg-violet-950/20 px-1 py-0.5 rounded border border-violet-900/30">Documents</code>.
+                    Все ассеты (PNG и WebP) сохраняются в указанную подпапку Android-директории <code className="text-violet-450 font-mono text-[10px] bg-violet-950/20 px-1 py-0.5 rounded border border-violet-900/30">Documents</code>.
                   </p>
                 </div>
               </div>
@@ -2230,6 +2049,59 @@ export default function App() {
                 className="py-2.5 px-6 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white border border-violet-500/20 font-bold text-xs rounded-xl shadow-lg shadow-violet-950/30 transition-all duration-200 active:scale-95 cursor-pointer"
               >
                 Готово
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear model cache confirmation modal (over settings) */}
+      {isClearCacheOpen && (
+        <div className="fixed inset-0 bg-zinc-950/80 backdrop-blur-md flex items-center justify-center z-[60] p-4 animate-in fade-in duration-200">
+          <div className="bg-zinc-900/95 border border-zinc-800 rounded-3xl shadow-2xl max-w-sm w-full p-6 flex flex-col gap-4 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-red-950/40 border border-red-900/40 flex items-center justify-center shrink-0">
+                <Trash2 className="w-4 h-4 text-red-400" />
+              </div>
+              <h3 className="font-extrabold text-zinc-100 text-sm tracking-tight">
+                Очистить кэш моделей?
+              </h3>
+            </div>
+            <p className="text-xs text-zinc-400 leading-relaxed">
+              Будут удалены <span className="font-bold text-red-400">все</span> скачанные
+              модели ИИ. Перед следующей обработкой их придётся скачивать заново
+              (десятки–сотни МБ трафика).
+            </p>
+            <p className="text-xs text-zinc-400 leading-relaxed">
+              Для подтверждения введите{' '}
+              <span className="font-mono font-bold text-red-400">УДАЛИТЬ</span>:
+            </p>
+            <input
+              type="text"
+              value={clearCacheInput}
+              onChange={(e) => setClearCacheInput(e.target.value)}
+              placeholder="УДАЛИТЬ"
+              spellCheck={false}
+              autoFocus
+              className="w-full bg-zinc-950/60 border border-zinc-800 hover:border-zinc-700 focus:border-red-500/60 focus:ring-[3px] focus:ring-red-500/10 rounded-xl px-3.5 py-2.5 text-sm font-mono text-zinc-200 placeholder-zinc-600 transition-all duration-300 outline-none"
+            />
+            <div className="flex justify-end gap-2.5 pt-1">
+              <button
+                onClick={() => setIsClearCacheOpen(false)}
+                className="py-2.5 px-4 bg-zinc-900/60 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 rounded-xl text-xs font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={async () => {
+                  if (!clearCacheConfirmed) return;
+                  setIsClearCacheOpen(false);
+                  await clearCustomModelCache();
+                }}
+                disabled={!clearCacheConfirmed}
+                className="py-2.5 px-4 bg-red-600 hover:bg-red-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white rounded-xl text-xs font-bold transition-all shadow-md cursor-pointer active:scale-95 disabled:cursor-not-allowed"
+              >
+                Удалить всё
               </button>
             </div>
           </div>

@@ -6,20 +6,42 @@
 import React, { useRef, useState } from 'react';
 import { Upload, Camera, Sparkles, Image as ImageIcon } from 'lucide-react';
 
+/** Минимум данных о модели для списка на главной (структурно совместим с SavedModel из App). */
+interface UploaderModel {
+  name: string;
+  url: string;
+  sizeLabel: string;
+}
+
 interface ImageUploaderProps {
   onImageSelected: (file: File) => void;
   useAIBgRemoval: boolean;
   onUseAIBgRemovalChange: (val: boolean) => void;
-  localModel: string;
+  /** Список моделей ИИ (пресеты + пользовательские) — как в настройках. */
+  modelsList: UploaderModel[];
+  /** URL активной модели. */
+  customModelUrl: string;
+  /** Статусы кэша по URL (native): скачана ли модель на устройство. */
+  cacheStatuses: { [url: string]: boolean };
+  onSelectModel: (url: string) => void;
   onOpenSettings: () => void;
+  /**
+   * Показывать ли быстрый выбор модели (только native: список, статусы кэша
+   * и customModelUrl относятся к Android-плагину — веб-конвейер их не читает).
+   */
+  showModelList: boolean;
 }
 
 export default function ImageUploader({
   onImageSelected,
   useAIBgRemoval,
   onUseAIBgRemovalChange,
-  localModel,
-  onOpenSettings
+  modelsList,
+  customModelUrl,
+  cacheStatuses,
+  onSelectModel,
+  onOpenSettings,
+  showModelList
 }: ImageUploaderProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
@@ -221,7 +243,7 @@ export default function ImageUploader({
           Перетащите файл сюда или нажмите для выбора из галереи
         </p>
         <span className="text-xs text-zinc-400 bg-zinc-950/80 border border-zinc-800 rounded-full px-4.5 py-1.5 font-mono tracking-wide shadow-inner">
-          PNG, JPG, SVG, WebP
+          PNG, JPG, WebP
         </span>
       </div>
 
@@ -269,26 +291,56 @@ export default function ImageUploader({
         </button>
       </div>
 
-      {/* AI Model Selector / Status block linking to settings */}
-      {useAIBgRemoval && (
+      {/* AI Model quick selector (same data as settings modal; native only —
+          в вебе список нативных моделей нерабочий: кэш не проверяется,
+          а выбор не влияет на обработку) */}
+      {useAIBgRemoval && showModelList && (
         <div className="w-full mt-4 bg-zinc-900/40 border border-zinc-800/80 rounded-2xl p-4.5 flex flex-col gap-3 shadow-md backdrop-blur-md animate-in fade-in duration-300">
           <div className="flex justify-between items-center text-xs">
-            <span className="font-bold text-zinc-300 uppercase tracking-wider">ИИ модель удаления фона</span>
+            <span className="font-bold text-zinc-300 uppercase tracking-wider">Модель ИИ</span>
             <button
               type="button"
               onClick={onOpenSettings}
               className="text-violet-400 hover:text-violet-300 font-bold flex items-center gap-1 transition-all cursor-pointer hover:underline"
             >
-              Настроить
+              Все настройки
             </button>
           </div>
-          <div className="flex items-center justify-between bg-zinc-950/60 border border-zinc-800/60 rounded-xl p-3">
-            <span className="font-medium text-zinc-400">
-              Локальный ИИ (Автономно)
-            </span>
-            <span className="bg-zinc-900 border border-zinc-800 text-zinc-300 px-2.5 py-1 rounded-lg font-mono text-[11px] font-bold">
-              {localModel}
-            </span>
+          <div className="flex flex-col gap-2">
+            {modelsList.map((model) => {
+              const isActive = customModelUrl === model.url;
+              const isCached = cacheStatuses[model.url] || false;
+              return (
+                <button
+                  key={model.url}
+                  type="button"
+                  onClick={() => onSelectModel(model.url)}
+                  className={`w-full flex items-center justify-between gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-all duration-200 cursor-pointer active:scale-[0.99] ${
+                    isActive
+                      ? 'bg-violet-950/25 border-violet-500 shadow-[0_2px_12px_rgba(139,92,246,0.15)]'
+                      : 'bg-zinc-950/60 border-zinc-800/60 hover:bg-zinc-900/40 hover:border-zinc-700'
+                  }`}
+                >
+                  <span className="text-xs font-semibold text-zinc-200 truncate min-w-0">
+                    {model.name}
+                  </span>
+                  <span className="flex items-center gap-1.5 shrink-0">
+                    <span className="text-[10px] px-2 py-0.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-400 font-mono font-bold">
+                      {model.sizeLabel}
+                    </span>
+                    {isCached ? (
+                      <span className="text-[10px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded-full whitespace-nowrap">
+                        ✓ скачана
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-semibold text-zinc-400 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded-full whitespace-nowrap">
+                        не скачана
+                      </span>
+                    )}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
