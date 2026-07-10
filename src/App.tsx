@@ -430,6 +430,85 @@ function removeCutoffForeigners(
   }
 }
 
+/**
+ * Заливает МЕЛКИЕ полностью замкнутые дыры альфы (модель пробивает отверстия
+ * на тёмных гранях внутри объекта). Дыра = прозрачная область (alpha<40),
+ * НЕ достижимая от границ канваса, площадью ≤ max(64px, 1.5% непрозрачного).
+ * Настоящие отверстия (бублик, дужка) больше порога — не трогаются.
+ * Полупрозрачность (alpha≥40, стекло/тени) не трогается. RGB заполняемых
+ * пикселей берётся из оригинала листа (в результате они premultiply-чёрные).
+ */
+function fillSmallAlphaHoles(imgData: ImageData, img: HTMLImageElement, rect: Rect): void {
+  const w = imgData.width, h = imgData.height;
+  const data = imgData.data;
+  const transparent = new Uint8Array(w * h);
+  let opaqueCount = 0;
+  for (let p = 0; p < w * h; p++) {
+    const a = data[p * 4 + 3];
+    if (a < 40) transparent[p] = 1;
+    else if (a > 127) opaqueCount++;
+  }
+  if (opaqueCount === 0) return;
+
+  // Достижимость прозрачного от границ (4-связность)
+  const reached = new Uint8Array(w * h);
+  const queue = new Int32Array(w * h);
+  let qt = 0;
+  const seed = (p: number) => {
+    if (transparent[p] === 1 && reached[p] === 0) { reached[p] = 1; queue[qt++] = p; }
+  };
+  for (let x = 0; x < w; x++) { seed(x); seed((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { seed(y * w); seed(y * w + w - 1); }
+  let qh = 0;
+  while (qh < qt) {
+    const p = queue[qh++];
+    const px = p % w, py = (p / w) | 0;
+    if (px > 0) seed(p - 1);
+    if (px < w - 1) seed(p + 1);
+    if (py > 0) seed(p - w);
+    if (py < h - 1) seed(p + w);
+  }
+
+  // Компоненты недостижимых дыр; мелкие — заливаем RGB-пикселями оригинала
+  const maxHole = Math.max(64, Math.round(opaqueCount * 0.015));
+  let origData: Uint8ClampedArray | null = null;
+  const labels = new Int32Array(w * h);
+  let n = 0;
+  for (let start = 0; start < w * h; start++) {
+    if (transparent[start] !== 1 || reached[start] === 1 || labels[start] !== 0) continue;
+    n++;
+    let qh2 = 0, qt2 = 0;
+    const comp: number[] = [];
+    labels[start] = n;
+    queue[qt2++] = start;
+    while (qh2 < qt2) {
+      const p = queue[qh2++];
+      comp.push(p);
+      const px = p % w, py = (p / w) | 0;
+      const tryP = (np: number) => {
+        if (transparent[np] === 1 && reached[np] === 0 && labels[np] === 0) { labels[np] = n; queue[qt2++] = np; }
+      };
+      if (px > 0) tryP(p - 1);
+      if (px < w - 1) tryP(p + 1);
+      if (py > 0) tryP(p - w);
+      if (py < h - 1) tryP(p + w);
+    }
+    if (comp.length > maxHole) continue;
+    if (!origData) {
+      const oc = cropToCanvas(img, rect);
+      const octx = oc.getContext('2d', { willReadFrequently: true });
+      if (!octx) return;
+      origData = octx.getImageData(0, 0, w, h).data;
+    }
+    for (const p of comp) {
+      data[p * 4] = origData[p * 4];
+      data[p * 4 + 1] = origData[p * 4 + 1];
+      data[p * 4 + 2] = origData[p * 4 + 2];
+      data[p * 4 + 3] = 255;
+    }
+  }
+}
+
 /** Площадь пересечения двух прямоугольников. */
 function rectIntersectionArea(a: Rect, b: Rect): number {
   const ix = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
@@ -1073,6 +1152,10 @@ export default function App() {
       }
       // Куски соседних объектов, вошедшие в рамку снаружи, — вон (любой режим)
       removeCutoffForeigners(imgData, img, rect, sheetBg);
+      // Мелкие замкнутые дыры: модель пробивает отверстия на тёмных гранях
+      // (кейс: чёрные точки внутри камней). RGB для заливки — из оригинала
+      // листа: в PNG у прозрачных пикселей цвет обнулён premultiply-ем.
+      fillSmallAlphaHoles(imgData, img, rect);
       ctx.putImageData(imgData, 0, 0);
       return trimCanvasTransparent(canvas);
     };
