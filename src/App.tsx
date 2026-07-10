@@ -54,9 +54,11 @@ const BIREFNET_BASE_MODEL_SIZE_BYTES = 489666838;
 const SAM_ENCODER_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/mobilesam_encoder.onnx';
 const SAM_ENCODER_SHA256 = '20deef402855b31222b528f52b04807e41ebe47216ac0e39a0729f43491a0209';
 const SAM_ENCODER_SIZE_BYTES = 28157093;
-const SAM_DECODER_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/mobilesam_decoder.onnx';
-const SAM_DECODER_SHA256 = '22cf85e35d14182f4b4712364264c06b22edbef63f065189586f080ef4e2f325';
-const SAM_DECODER_SIZE_BYTES = 16500272;
+// multi-mask декодер: 4 кандидата, выбор в нативе (одиночный экспорт выбирал
+// вырожденную «всю сцену» на листах с несколькими объектами)
+const SAM_DECODER_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/mobilesam_decoder_multi.onnx';
+const SAM_DECODER_SHA256 = '8976b90a87ba50a6a72217a5ff994f7d25ce16f2229fcc1ed259e1294c622ffe';
+const SAM_DECODER_SIZE_BYTES = 16496559;
 
 /** SHA-256 известен только для наших моделей — для них включаем проверку. */
 const getSha256ForUrl = (url: string): string | undefined =>

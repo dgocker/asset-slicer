@@ -991,38 +991,87 @@ class BackgroundRemovalPlugin : Plugin() {
                         )
                     )
 
-                    val masksVal = results!!.get("masks")
-                    val masksTensor =
-                        (if (masksVal.isPresent) masksVal.get() else results!!.get(0)) as OnnxTensor
-                    val mShape = masksTensor.info.shape
-                    val mh = mShape[mShape.size - 2].toInt()
-                    val mw = mShape[mShape.size - 1].toInt()
-
-                    var iou = 0f
+                    // ВАЖНО: зашитый в граф Resize к orig_im_size у этих экспортов сломан
+                    // (маска «размазывается» по вертикали — проверено локально), поэтому
+                    // берём low_res_masks (256×256 в системе ПАДДИРОВАННОГО 1024-кадра,
+                    // делитель 4) и масштабируем сами. Декодер multi-mask: 4 кандидата
+                    // («часть / объект / группа / сцена») — отбрасываем вырожденную
+                    // «всю сцену» (>50% листа) и берём max iou из оставшихся.
+                    val lowVal = results!!.get("low_res_masks")
+                    val lowTensor =
+                        (if (lowVal.isPresent) lowVal.get() else results!!.get(0)) as OnnxTensor
+                    val lShape = lowTensor.info.shape // [1, K, 256, 256]
+                    val kMasks = lShape[1].toInt()
+                    val side = lShape[lShape.size - 1].toInt() // 256
+                    val ious = FloatArray(kMasks)
                     try {
                         val iouVal = results!!.get("iou_predictions")
                         if (iouVal.isPresent) {
                             val buf = (iouVal.get() as OnnxTensor).floatBuffer
-                            if (buf.remaining() > 0) iou = buf.get(0)
+                            for (k in 0 until minOf(kMasks, buf.remaining())) ious[k] = buf.get(k)
                         }
-                    } catch (e: Exception) {
-                        // iou опционален — маска важнее
-                    }
+                    } catch (e: Exception) {}
 
-                    // Построчно (логиты origH×origW могут быть десятки МБ):
-                    // бинаризация >0 → белый непрозрачный пиксель, иначе прозрачный.
-                    // ALPHA_8 в PNG прозрачность не сохраняет корректно — ARGB.
-                    val fb = masksTensor.floatBuffer
-                    maskBitmap = Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888)
-                    val rowF = FloatArray(mw)
-                    val rowPx = IntArray(mw)
-                    for (y in 0 until mh) {
-                        fb.get(rowF)
-                        for (x in 0 until mw) {
-                            rowPx[x] = if (rowF[x] > 0f) 0xFFFFFFFF.toInt() else 0
+                    // Контент внутри паддированного кадра (паддинг справа-снизу)
+                    val contentW = Math.round(samOrigW * samScale / 4f).coerceIn(1, side)
+                    val contentH = Math.round(samOrigH * samScale / 4f).coerceIn(1, side)
+                    val lowBuf = lowTensor.floatBuffer
+                    val all = FloatArray(kMasks * side * side)
+                    lowBuf.get(all)
+
+                    var bestK = -1
+                    var bestIou = -Float.MAX_VALUE
+                    val contentTotal = contentW * contentH
+                    for (k in 0 until kMasks) {
+                        var pos = 0
+                        val off = k * side * side
+                        for (y in 0 until contentH) {
+                            val row = off + y * side
+                            for (x in 0 until contentW) if (all[row + x] > 0f) pos++
                         }
-                        maskBitmap!!.setPixels(rowPx, 0, mw, 0, y, mw, 1)
+                        val areaFrac = pos.toFloat() / contentTotal
+                        if (areaFrac > 0.0005f && areaFrac <= 0.5f && ious[k] > bestIou) {
+                            bestIou = ious[k]
+                            bestK = k
+                        }
                     }
+                    if (bestK < 0) {
+                        call.reject("SAM: no suitable mask candidate")
+                        return@execute
+                    }
+                    val iou = ious[bestK]
+
+                    // 256-кроп контента → белый/прозрачный → bilinear к оригиналу → порог
+                    var lowBmp: Bitmap? = null
+                    var scaled: Bitmap? = null
+                    try {
+                        lowBmp = Bitmap.createBitmap(contentW, contentH, Bitmap.Config.ARGB_8888)
+                        val rowPx = IntArray(contentW)
+                        val off = bestK * side * side
+                        for (y in 0 until contentH) {
+                            val row = off + y * side
+                            for (x in 0 until contentW) {
+                                rowPx[x] = if (all[row + x] > 0f) 0xFFFFFFFF.toInt() else 0
+                            }
+                            lowBmp.setPixels(rowPx, 0, contentW, 0, y, contentW, 1)
+                        }
+                        scaled = Bitmap.createScaledBitmap(lowBmp, samOrigW, samOrigH, true)
+                        // Порог после bilinear: alpha>127 → белый, иначе прозрачный
+                        maskBitmap = Bitmap.createBitmap(samOrigW, samOrigH, Bitmap.Config.ARGB_8888)
+                        val outRow = IntArray(samOrigW)
+                        for (y in 0 until samOrigH) {
+                            scaled.getPixels(outRow, 0, samOrigW, 0, y, samOrigW, 1)
+                            for (x in 0 until samOrigW) {
+                                outRow[x] = if ((outRow[x] ushr 24) > 127) 0xFFFFFFFF.toInt() else 0
+                            }
+                            maskBitmap!!.setPixels(outRow, 0, samOrigW, 0, y, samOrigW, 1)
+                        }
+                    } finally {
+                        lowBmp?.recycle()
+                        scaled?.recycle()
+                    }
+                    val mw = samOrigW
+                    val mh = samOrigH
 
                     val baos = java.io.ByteArrayOutputStream()
                     maskBitmap!!.compress(Bitmap.CompressFormat.PNG, 100, baos)
