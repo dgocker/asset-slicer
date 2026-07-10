@@ -2,6 +2,10 @@
 
 🇬🇧 English | [🇷🇺 Русский](README.ru.md)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) [![Platform](https://img.shields.io/badge/Platform-Android-3DDC84)](https://github.com/dgocker/asset-slicer/releases) [![Build APK](https://github.com/dgocker/asset-slicer/actions/workflows/build-apk.yml/badge.svg)](https://github.com/dgocker/asset-slicer/actions/workflows/build-apk.yml)
+
+**📱 [Download APK (latest release)](https://github.com/dgocker/asset-slicer/releases/latest/download/asset-slicer.apk)**
+
 Cut game assets out of sprite sheets, icon packs and photos — entirely on your phone,
 offline. Select objects on a sheet, and an on-device neural network extracts each one
 as a separate transparent-background image. No servers, no uploads.
@@ -38,8 +42,7 @@ inputs/outputs kept. Interface: input tensor `input_image`, 1024×1024, ImageNet
 normalization; output is logits, passed through sigmoid. You can also add any custom
 ONNX model by URL from the settings screen.
 
-**Note for forks:** the preset URLs point to the original author's server. If you fork
-this project, host the model files yourself and update the URLs in `src/App.tsx`. The
+**Model hosting:** presets download from this repository's [GitHub Releases](https://github.com/dgocker/asset-slicer/releases). If you fork, attach the models to your own release and update the URLs in `src/App.tsx`. The
 models can be produced from the [onnx-community/BiRefNet-ONNX](https://huggingface.co/onnx-community/BiRefNet-ONNX)
 / [onnx-community/BiRefNet_lite-ONNX](https://huggingface.co/onnx-community/BiRefNet_lite-ONNX)
 exports with `onnxconverter_common.float16.convert_float_to_float16(keep_io_types=True)`.

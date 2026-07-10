@@ -44,6 +44,10 @@ class BackgroundRemovalPlugin : Plugin() {
         /** Ключ tree-URI папки экспорта в SharedPreferences("export_prefs"). */
         private const val EXPORT_TREE_URI_KEY = "tree_uri"
 
+        /** Общий объём ОЗУ устройства (байты); заполняется в load(). 0 = неизвестно. */
+        @Volatile
+        var totalDeviceMemBytes: Long = 0L
+
         @Volatile
         private var ortEnv: OrtEnvironment? = null
         @Volatile
@@ -92,7 +96,14 @@ class BackgroundRemovalPlugin : Plugin() {
                     if (!sessionCreated) {
                         OrtSession.SessionOptions().use { opts ->
                             val numCores = Runtime.getRuntime().availableProcessors()
-                            opts.setIntraOpNumThreads(maxOf(1, numCores - 1))
+                            // Адаптация под железо: на устройствах с малым ОЗУ (<4ГБ)
+                            // ограничиваем потоки — каждый поток инференса добавляет
+                            // рабочие буферы, и на слабых устройствах 8 потоков дают
+                            // давление на память без выигрыша по скорости.
+                            val lowRam = totalDeviceMemBytes in 1..(4L * 1024 * 1024 * 1024)
+                            val threads = if (lowRam) minOf(4, maxOf(1, numCores - 1))
+                                          else maxOf(1, numCores - 1)
+                            opts.setIntraOpNumThreads(threads)
                             opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                             // Без арены: ORT по умолчанию НЕ возвращает память ОС между
                             // прогонами — на больших моделях (BiRefNet base: гигабайты
@@ -133,6 +144,27 @@ class BackgroundRemovalPlugin : Plugin() {
             normalizedUrl.hashCode().toString()
         }
         return File(context.cacheDir, "model_$hash.onnx")
+    }
+
+    override fun load() {
+        super.load()
+        try {
+            val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val mi = android.app.ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mi)
+            totalDeviceMemBytes = mi.totalMem
+        } catch (e: Exception) {
+            // неизвестное железо — работаем с дефолтами
+        }
+    }
+
+    /** Информация об устройстве для адаптации UI (рекомендации моделей по ОЗУ). */
+    @PluginMethod
+    fun getDeviceInfo(call: PluginCall) {
+        val res = JSObject()
+        res.put("totalMemBytes", totalDeviceMemBytes)
+        res.put("cores", Runtime.getRuntime().availableProcessors())
+        call.resolve(res)
     }
 
     @PluginMethod

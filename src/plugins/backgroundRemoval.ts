@@ -75,6 +75,9 @@ export interface BackgroundRemovalPlugin {
 
   isModelCached(options: { url: string }): Promise<{ isCached: boolean }>;
 
+  /** ОЗУ и ядра устройства — для рекомендаций моделей под железо. */
+  getDeviceInfo(): Promise<{ totalMemBytes: number; cores: number }>;
+
   clearCachedModels(): Promise<{ deletedCount: number }>;
 
   addListener(

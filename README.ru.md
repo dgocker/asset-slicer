@@ -2,6 +2,10 @@
 
 [🇬🇧 English](README.md) | 🇷🇺 Русский
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) [![Platform](https://img.shields.io/badge/Platform-Android-3DDC84)](https://github.com/dgocker/asset-slicer/releases) [![Build APK](https://github.com/dgocker/asset-slicer/actions/workflows/build-apk.yml/badge.svg)](https://github.com/dgocker/asset-slicer/actions/workflows/build-apk.yml)
+
+**📱 [Скачать APK (последний релиз)](https://github.com/dgocker/asset-slicer/releases/latest/download/asset-slicer.apk)**
+
 Вырезание игровых ассетов из спрайт-листов, наборов иконок и фотографий — целиком на
 телефоне, офлайн. Выделите объекты на листе, и локальная нейросеть вырежет каждый из
 них отдельной картинкой с прозрачным фоном. Без серверов и без отправки изображений.
@@ -41,8 +45,7 @@
 ImageNet-нормализация; на выходе логиты, к которым применяется sigmoid. Через экран
 настроек можно добавить любую свою ONNX-модель по URL.
 
-**Примечание для форков:** URL пресетов указывают на сервер автора. При форке
-захостите файлы моделей сами и обновите URL в `src/App.tsx`. Модели можно получить из
+**Хостинг моделей:** пресеты скачиваются из [GitHub Releases](https://github.com/dgocker/asset-slicer/releases) этого репозитория. При форке приложите модели к своему релизу и обновите URL в `src/App.tsx`. Модели можно получить из
 экспортов [onnx-community/BiRefNet-ONNX](https://huggingface.co/onnx-community/BiRefNet-ONNX)
 / [onnx-community/BiRefNet_lite-ONNX](https://huggingface.co/onnx-community/BiRefNet_lite-ONNX)
 через `onnxconverter_common.float16.convert_float_to_float16(keep_io_types=True)`.

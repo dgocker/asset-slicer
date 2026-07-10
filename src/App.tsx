@@ -32,12 +32,12 @@ import {
 } from './utils/objectDetect';
 
 // Модель по умолчанию: BiRefNet_lite fp16 (ONNX opset 17), raw-режим по объектам
-const BIREFNET_MODEL_URL = 'https://78.17.74.156:8443/static/birefnet_lite_fp16.onnx';
+const BIREFNET_MODEL_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/birefnet_lite_fp16.onnx';
 const BIREFNET_MODEL_SHA256 = '311cfd8088ee71224ba0687b00dfad1ed28fc05aae0ce64e87965cc3d4b29d6a';
 const BIREFNET_MODEL_SIZE_BYTES = 114538787;
 // Пресет «Качество»: BiRefNet base fp16 (Swin-Large) — сильнее на мелких/бледных
 // объектах, но тяжелее и медленнее; для мощных телефонов (8+ ГБ ОЗУ)
-const BIREFNET_BASE_MODEL_URL = 'https://78.17.74.156:8443/static/birefnet_base_fp16.onnx';
+const BIREFNET_BASE_MODEL_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/birefnet_base_fp16.onnx';
 const BIREFNET_BASE_MODEL_SHA256 = '323232ec73a04ac4d0ef8c325a75aa8d69ed7062235a7cf9941769fae4c9709f';
 const BIREFNET_BASE_MODEL_SIZE_BYTES = 489666838;
 
@@ -687,8 +687,26 @@ export default function App() {
     }
   }, [view, checkCustomModelCacheStatus]);
 
+  /** ОЗУ устройства (ГБ) — для предупреждения на тяжёлых моделях. 0 = неизвестно. */
+  const deviceMemGBRef = useRef(0);
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    BackgroundRemoval.getDeviceInfo()
+      .then(info => { deviceMemGBRef.current = info.totalMemBytes / (1024 ** 3); })
+      .catch(() => {});
+  }, []);
+
   /** Выбор модели из списка на главной — тот же эффект, что тап в настройках. */
   const handleSelectModel = useCallback((url: string) => {
+    // Адаптация под железо: тяжёлая base-модель на устройствах с малым ОЗУ
+    // может вылетать — честно предупреждаем до выбора
+    const memGB = deviceMemGBRef.current;
+    if (url === BIREFNET_BASE_MODEL_URL && memGB > 0 && memGB < 5.5) {
+      const ok = window.confirm(
+        `На устройстве ${memGB.toFixed(1)} ГБ ОЗУ. Модель «Качество» (467 МБ) требует 6+ ГБ и может вылетать. Продолжить?`
+      );
+      if (!ok) return;
+    }
     setCustomModelUrl(url);
     localStorage.setItem('customModelUrl', url);
     checkCustomModelCacheStatus(url);
@@ -1725,11 +1743,7 @@ export default function App() {
                         return (
                           <div 
                             key={idx}
-                            onClick={async () => {
-                              setCustomModelUrl(model.url);
-                              localStorage.setItem('customModelUrl', model.url);
-                              await checkCustomModelCacheStatus(model.url);
-                            }}
+                            onClick={() => handleSelectModel(model.url)}
                             className={`p-4 rounded-2xl border transition-all duration-300 cursor-pointer flex flex-col gap-2 relative overflow-hidden active:scale-[0.98] active:translate-y-[1px] ${
                               isActive
                                 ? 'bg-violet-950/25 border-violet-500 shadow-[0_4px_20px_rgba(139,92,246,0.15)]'
