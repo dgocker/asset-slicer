@@ -511,69 +511,6 @@ function fillSmallAlphaHoles(imgData: ImageData, img: HTMLImageElement, rect: Re
   }
 }
 
-/**
- * Деконтаминация кромки: полупрозрачные краевые пиксели содержат подмешанный
- * цвет фона листа (на тёмной подложке проступает цветной полоской). Для
- * каждого semi-пикселя оценивается ЛОКАЛЬНЫЙ фон (средний цвет оригинала в
- * соседних полностью прозрачных точках результата; фолбэк — цвет фона листа)
- * и вклад фона размешивается: rgb_true = (rgb − (1−a)·bg) / a.
- */
-function defringeEdges(
-  imgData: ImageData,
-  img: HTMLImageElement,
-  rect: Rect,
-  sheetBg: ColorRGB,
-): void {
-  const w = imgData.width, h = imgData.height;
-  const data = imgData.data;
-  // есть ли вообще semi-кромка
-  let semiCount = 0;
-  for (let p = 0; p < w * h; p++) {
-    const a = data[p * 4 + 3];
-    if (a >= 8 && a <= 245) semiCount++;
-  }
-  if (semiCount === 0) return;
-
-  const oc = cropToCanvas(img, rect);
-  const octx = oc.getContext('2d', { willReadFrequently: true });
-  if (!octx) return;
-  const orig = octx.getImageData(0, 0, w, h).data;
-
-  const R = 4;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const p = y * w + x;
-      const a = data[p * 4 + 3];
-      if (a < 8 || a > 245) continue;
-      // локальный фон: оригинальные цвета в прозрачных соседях
-      let br = 0, bg_ = 0, bb = 0, cnt = 0;
-      for (let dy = -R; dy <= R; dy++) {
-        const ny = y + dy;
-        if (ny < 0 || ny >= h) continue;
-        for (let dx = -R; dx <= R; dx++) {
-          const nx = x + dx;
-          if (nx < 0 || nx >= w) continue;
-          const np = ny * w + nx;
-          if (data[np * 4 + 3] < 8) {
-            br += orig[np * 4];
-            bg_ += orig[np * 4 + 1];
-            bb += orig[np * 4 + 2];
-            cnt++;
-          }
-        }
-      }
-      const bgR = cnt > 0 ? br / cnt : sheetBg.r;
-      const bgG = cnt > 0 ? bg_ / cnt : sheetBg.g;
-      const bgB = cnt > 0 ? bb / cnt : sheetBg.b;
-      const t = a / 255;
-      const inv = 1 - t;
-      data[p * 4] = Math.max(0, Math.min(255, Math.round((orig[p * 4] - inv * bgR) / t)));
-      data[p * 4 + 1] = Math.max(0, Math.min(255, Math.round((orig[p * 4 + 1] - inv * bgG) / t)));
-      data[p * 4 + 2] = Math.max(0, Math.min(255, Math.round((orig[p * 4 + 2] - inv * bgB) / t)));
-    }
-  }
-}
-
 /** Площадь пересечения двух прямоугольников. */
 function rectIntersectionArea(a: Rect, b: Rect): number {
   const ix = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
@@ -1373,8 +1310,6 @@ export default function App() {
       fillSmallAlphaHoles(imgData, img, rect);
       // «Консилиум»: SAM судит результат (только если эмбеддинг листа готов)
       await consensusInspect(imgData);
-      // Кромка без подмешанного фона (зелёные полоски по краям на тёмном фоне)
-      defringeEdges(imgData, img, rect, sheetBg);
       ctx.putImageData(imgData, 0, 0);
       return trimCanvasTransparent(canvas);
     };
