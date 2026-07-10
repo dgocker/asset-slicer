@@ -49,6 +49,30 @@ export interface BackgroundRemovalPlugin {
 
   releaseModel(): Promise<void>;
 
+  /**
+   * Открывает системный выбор папки (SAF, ACTION_OPEN_DOCUMENT_TREE).
+   * Выбранный tree-URI сохраняется в SharedPreferences с persistable-правами.
+   * Реджектится, если пользователь закрыл пикер без выбора.
+   */
+  pickExportFolder(): Promise<{ uri: string; name: string }>;
+
+  /**
+   * Ранее выбранная папка экспорта. Пустой объект, если папка не выбрана
+   * или разрешение на неё отозвано/протухло.
+   */
+  getExportFolder(): Promise<{ uri?: string; name?: string }>;
+
+  /**
+   * Сохраняет файл (base64, с dataURL-префиксом или без) в выбранную
+   * SAF-папку. {saved:false, reason:'no-folder'} — папка не выбрана либо
+   * доступ к ней потерян; вызывающий код решает, что делать дальше.
+   */
+  saveToExportFolder(options: {
+    filename: string;
+    base64: string;
+    mime: string;
+  }): Promise<{ saved: boolean; path?: string; reason?: string }>;
+
   isModelCached(options: { url: string }): Promise<{ isCached: boolean }>;
 
   clearCachedModels(): Promise<{ deletedCount: number }>;

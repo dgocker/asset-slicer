@@ -1,5 +1,8 @@
 package com.assetslicer.app
 
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -9,10 +12,13 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.net.Uri
 import android.util.Base64
+import androidx.activity.result.ActivityResult
+import androidx.documentfile.provider.DocumentFile
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
+import com.getcapacitor.annotation.ActivityCallback
 import com.getcapacitor.annotation.CapacitorPlugin
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
@@ -35,6 +41,9 @@ class BackgroundRemovalPlugin : Plugin() {
     private val executorService = Executors.newSingleThreadExecutor()
 
     companion object {
+        /** Ключ tree-URI папки экспорта в SharedPreferences("export_prefs"). */
+        private const val EXPORT_TREE_URI_KEY = "tree_uri"
+
         @Volatile
         private var ortEnv: OrtEnvironment? = null
         @Volatile
@@ -760,6 +769,129 @@ class BackgroundRemovalPlugin : Plugin() {
                 } catch (e: Exception) {
                     call.reject("Failed to clear cached models: ${e.message}", e)
                 }
+            }
+        }
+    }
+
+    // ---------- Экспорт ассетов в выбранную пользователем папку (SAF) ----------
+
+    private fun exportPrefs() =
+        context.getSharedPreferences("export_prefs", Context.MODE_PRIVATE)
+
+    /** Сохранённый tree-URI папки экспорта, если persistable-права ещё живы. */
+    private fun persistedTreeUri(): Uri? {
+        val uriStr = exportPrefs().getString(EXPORT_TREE_URI_KEY, null) ?: return null
+        val uri = Uri.parse(uriStr)
+        val stillGranted = context.contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isWritePermission
+        }
+        return if (stillGranted) uri else null
+    }
+
+    /** Открывает системный выбор папки (ACTION_OPEN_DOCUMENT_TREE). */
+    @PluginMethod
+    fun pickExportFolder(call: PluginCall) {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        intent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        )
+        startActivityForResult(call, intent, "onFolderPicked")
+    }
+
+    @ActivityCallback
+    fun onFolderPicked(call: PluginCall, result: ActivityResult) {
+        val uri = result.data?.data
+        if (result.resultCode != Activity.RESULT_OK || uri == null) {
+            call.reject("Folder selection cancelled")
+            return
+        }
+        try {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (e: SecurityException) {
+            call.reject("Failed to persist folder permission: ${e.message}", e)
+            return
+        }
+        exportPrefs().edit().putString(EXPORT_TREE_URI_KEY, uri.toString()).apply()
+
+        val name = DocumentFile.fromTreeUri(context, uri)?.name
+            ?: uri.lastPathSegment
+            ?: "folder"
+        val res = JSObject()
+        res.put("uri", uri.toString())
+        res.put("name", name)
+        call.resolve(res)
+    }
+
+    /** Ранее выбранная папка экспорта ({} — не выбрана или права отозваны). */
+    @PluginMethod
+    fun getExportFolder(call: PluginCall) {
+        val res = JSObject()
+        val uri = persistedTreeUri()
+        if (uri != null) {
+            val doc = DocumentFile.fromTreeUri(context, uri)
+            if (doc != null && doc.canWrite()) {
+                res.put("uri", uri.toString())
+                res.put("name", doc.name ?: uri.lastPathSegment ?: "folder")
+            }
+        }
+        call.resolve(res)
+    }
+
+    /**
+     * Пишет файл (base64, dataURL-префикс допустим) в выбранную SAF-папку.
+     * resolve({saved:false, reason:'no-folder'}) — папка не выбрана либо
+     * права протухли (SecurityException); reject — реальная ошибка записи.
+     */
+    @PluginMethod
+    fun saveToExportFolder(call: PluginCall) {
+        val filename = call.getString("filename")
+        val base64 = call.getString("base64")
+        if (filename.isNullOrEmpty() || base64.isNullOrEmpty()) {
+            call.reject("filename and base64 parameters are required")
+            return
+        }
+        val mime = call.getString("mime") ?: "application/octet-stream"
+
+        executorService.execute {
+            try {
+                val treeUri = persistedTreeUri()
+                val dir = if (treeUri != null) DocumentFile.fromTreeUri(context, treeUri) else null
+                if (treeUri == null || dir == null || !dir.canWrite()) {
+                    val res = JSObject()
+                    res.put("saved", false)
+                    res.put("reason", "no-folder")
+                    call.resolve(res)
+                    return@execute
+                }
+
+                // Отрезаем dataURL-префикс ("data:image/png;base64,..."), если есть
+                val cleanBase64 = base64.substringAfter(',', base64)
+                val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+
+                // Существующее имя система дополнит суффиксом автоматически
+                val file = dir.createFile(mime, filename)
+                    ?: throw Exception("Failed to create file in the selected folder")
+                val output = context.contentResolver.openOutputStream(file.uri)
+                    ?: throw Exception("Failed to open output stream for ${file.uri}")
+                output.use { it.write(bytes) }
+
+                val res = JSObject()
+                res.put("saved", true)
+                res.put("path", "${dir.name ?: "folder"}/${file.name ?: filename}")
+                call.resolve(res)
+            } catch (e: SecurityException) {
+                // Права на папку отозваны/протухли — как «папка не выбрана»
+                val res = JSObject()
+                res.put("saved", false)
+                res.put("reason", "no-folder")
+                call.resolve(res)
+            } catch (e: Exception) {
+                call.reject("Failed to save file: ${e.message}", e)
             }
         }
     }

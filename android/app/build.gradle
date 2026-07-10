@@ -61,6 +61,8 @@ dependencies {
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.18.0'
+    // SAF: работа с деревом документов выбранной пользователем папки экспорта
+    implementation 'androidx.documentfile:documentfile:1.0.1'
 }
 
 apply from: 'capacitor.build.gradle'

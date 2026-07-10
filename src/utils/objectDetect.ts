@@ -44,9 +44,115 @@ export function estimateBackgroundColor(img: ImageData): ColorRGB {
   return { r: median(rs), g: median(gs), b: median(bs) };
 }
 
+/** Порог отличия пикселя от ЛОКАЛЬНОЙ модели фона (box-blur), см. buildForegroundMask. */
+const LOCAL_BG_THRESHOLD = 18;
+
+/** Максимум пикселей, по которым честно считается локальное размытие;
+ *  бо́льшие изображения субсэмплируются (blur гладкий — потери нет). */
+const LOCAL_BG_MAX_PIXELS = 1 << 21; // ~2 Мп
+
+/**
+ * Локальная модель фона: сепарабельный box-blur RGB-каналов через
+ * кумулятивные суммы, O(n). Результат — Float32Array длиной w*h*3 (R,G,B).
+ */
+export function boxBlurRGB(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  radius: number,
+): Float32Array {
+  const n = width * height;
+  const out = new Float32Array(n * 3);
+  const tmp = new Float32Array(n);
+  const prefixRow = new Float64Array(width + 1);
+  const prefixCol = new Float64Array(height + 1);
+
+  for (let c = 0; c < 3; c++) {
+    // Горизонтальный проход (скользящее среднее через префиксные суммы)
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      let acc = 0;
+      for (let x = 0; x < width; x++) {
+        acc += data[(row + x) * 4 + c];
+        prefixRow[x + 1] = acc;
+      }
+      for (let x = 0; x < width; x++) {
+        const x0 = x - radius > 0 ? x - radius : 0;
+        const x1 = x + radius < width - 1 ? x + radius : width - 1;
+        tmp[row + x] = (prefixRow[x1 + 1] - prefixRow[x0]) / (x1 - x0 + 1);
+      }
+    }
+    // Вертикальный проход
+    for (let x = 0; x < width; x++) {
+      let acc = 0;
+      for (let y = 0; y < height; y++) {
+        acc += tmp[y * width + x];
+        prefixCol[y + 1] = acc;
+      }
+      for (let y = 0; y < height; y++) {
+        const y0 = y - radius > 0 ? y - radius : 0;
+        const y1 = y + radius < height - 1 ? y + radius : height - 1;
+        out[(y * width + x) * 3 + c] = (prefixCol[y1 + 1] - prefixCol[y0]) / (y1 - y0 + 1);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Локальная модель фона изображения: box-blur радиусом
+ * max(16, min(w,h)/10). Большие изображения субсэмплируются до ~2 Мп
+ * (шаг step), чтобы не раздувать память; blur настолько гладкий, что
+ * потери на субсэмпле пренебрежимы. Возвращает размытые каналы + step.
+ */
+function buildLocalBackground(img: ImageData): {
+  blur: Float32Array;
+  step: number;
+  subW: number;
+  subH: number;
+} {
+  const { data, width, height } = img;
+  let step = 1;
+  while (Math.ceil(width / step) * Math.ceil(height / step) > LOCAL_BG_MAX_PIXELS) step++;
+
+  const subW = Math.ceil(width / step);
+  const subH = Math.ceil(height / step);
+  let subData: Uint8ClampedArray;
+  if (step === 1) {
+    subData = data;
+  } else {
+    subData = new Uint8ClampedArray(subW * subH * 4);
+    for (let sy = 0; sy < subH; sy++) {
+      const y = sy * step;
+      for (let sx = 0; sx < subW; sx++) {
+        const si = (sy * subW + sx) * 4;
+        const i = (y * width + sx * step) * 4;
+        subData[si] = data[i];
+        subData[si + 1] = data[i + 1];
+        subData[si + 2] = data[i + 2];
+        subData[si + 3] = data[i + 3];
+      }
+    }
+  }
+
+  const radiusFull = Math.max(16, Math.round(Math.min(width, height) / 10));
+  const radius = Math.max(1, Math.round(radiusFull / step));
+  return { blur: boxBlurRGB(subData, subW, subH, radius), step, subW, subH };
+}
+
 /**
  * Строит бинарную fg-маску: пиксель считается объектом, если
- * максимальная поканальная разница с цветом фона превышает threshold.
+ * (1) максимальная поканальная разница с ГЛОБАЛЬНЫМ цветом фона (медиана
+ * периметра) превышает threshold И (2) разница с ЛОКАЛЬНОЙ моделью фона
+ * (box-blur окрестности) превышает LOCAL_BG_THRESHOLD. Второй критерий
+ * убирает «блобы» на градиентных фонах: гладкий градиент почти не
+ * отличается от собственного размытия, а настоящий объект резко отличается
+ * и от краевого цвета, и от локального фона.
+ *
+ * ПОБОЧКА: интерьер крупного однотонного объекта ≈ его локальному размытию,
+ * поэтому маска может стать «кольцом» — вызывающий код обязан применять
+ * заливку дыр (fillMaskHoles; refineForegroundMask делает это сам).
+ *
  * Полностью прозрачные пиксели считаются фоном.
  * Цвет фона можно передать явно (bgOverride) — например, оценку по
  * периметру всего листа для маски внутри отдельной рамки.
@@ -59,16 +165,77 @@ export function buildForegroundMask(
   const bg = bgOverride || estimateBackgroundColor(img);
   const { data, width, height } = img;
   const mask = new Uint8Array(width * height);
+  const { blur, step, subW, subH } = buildLocalBackground(img);
 
-  for (let p = 0, i = 0; p < mask.length; p++, i += 4) {
-    if (data[i + 3] < 16) continue; // прозрачный = фон
-    const dr = Math.abs(data[i] - bg.r);
-    const dg = Math.abs(data[i + 1] - bg.g);
-    const db = Math.abs(data[i + 2] - bg.b);
-    const maxDiff = dr > dg ? (dr > db ? dr : db) : (dg > db ? dg : db);
-    if (maxDiff > threshold) mask[p] = 1;
+  for (let y = 0, p = 0; y < height; y++) {
+    const sy = Math.min(subH - 1, (y / step) | 0);
+    for (let x = 0; x < width; x++, p++) {
+      const i = p * 4;
+      if (data[i + 3] < 16) continue; // прозрачный = фон
+      const dr = Math.abs(data[i] - bg.r);
+      const dg = Math.abs(data[i + 1] - bg.g);
+      const db = Math.abs(data[i + 2] - bg.b);
+      const maxDiff = dr > dg ? (dr > db ? dr : db) : (dg > db ? dg : db);
+      if (maxDiff <= threshold) continue;
+
+      const bi = (sy * subW + Math.min(subW - 1, (x / step) | 0)) * 3;
+      const lr = Math.abs(data[i] - blur[bi]);
+      const lg = Math.abs(data[i + 1] - blur[bi + 1]);
+      const lb = Math.abs(data[i + 2] - blur[bi + 2]);
+      const maxLocal = lr > lg ? (lr > lb ? lr : lb) : (lg > lb ? lg : lb);
+      if (maxLocal > LOCAL_BG_THRESHOLD) mask[p] = 1;
+    }
   }
   return mask;
+}
+
+/**
+ * Заливка дыр: flood-fill фоновых пикселей от границ изображения
+ * (4-связность); фоновые области, НЕ достижимые от границ (замкнутые внутри
+ * fg), переводятся в fg. Нужна после buildForegroundMask: локальный критерий
+ * превращает интерьер крупных однотонных объектов в «кольцо».
+ * Возвращает новую маску, вход не мутирует.
+ */
+export function fillMaskHoles(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+): Uint8Array {
+  const reached = new Uint8Array(width * height);
+  const queue = new Int32Array(width * height);
+  let qTail = 0;
+
+  const seed = (p: number) => {
+    if (mask[p] === 0 && reached[p] === 0) {
+      reached[p] = 1;
+      queue[qTail++] = p;
+    }
+  };
+  for (let x = 0; x < width; x++) {
+    seed(x);
+    seed((height - 1) * width + x);
+  }
+  for (let y = 0; y < height; y++) {
+    seed(y * width);
+    seed(y * width + width - 1);
+  }
+
+  let qHead = 0;
+  while (qHead < qTail) {
+    const p = queue[qHead++];
+    const x = p % width;
+    const y = (p - x) / width;
+    if (x > 0 && mask[p - 1] === 0 && reached[p - 1] === 0) { reached[p - 1] = 1; queue[qTail++] = p - 1; }
+    if (x < width - 1 && mask[p + 1] === 0 && reached[p + 1] === 0) { reached[p + 1] = 1; queue[qTail++] = p + 1; }
+    if (y > 0 && mask[p - width] === 0 && reached[p - width] === 0) { reached[p - width] = 1; queue[qTail++] = p - width; }
+    if (y < height - 1 && mask[p + width] === 0 && reached[p + width] === 0) { reached[p + width] = 1; queue[qTail++] = p + width; }
+  }
+
+  const out = new Uint8Array(mask);
+  for (let p = 0; p < out.length; p++) {
+    if (out[p] === 0 && reached[p] === 0) out[p] = 1;
+  }
+  return out;
 }
 
 /**
@@ -136,13 +303,16 @@ export interface RefinedMasks {
   grown: Uint8Array;
 }
 
-/** Морфологическое закрытие 5×5 (dilate->erode), затем dilate 9×9. */
+/** Морфологическое закрытие 5×5 (dilate->erode) + заливка дыр, затем dilate 9×9.
+ *  Заливка дыр обязательна: локальный критерий buildForegroundMask оставляет
+ *  от крупных однотонных объектов «кольцо» — интерьер восстанавливается здесь. */
 export function refineForegroundMask(
   fg: Uint8Array,
   width: number,
   height: number,
 ): RefinedMasks {
-  const closed = erodeBinary(dilateBinary(fg, width, height, 2), width, height, 2);
+  const closedRaw = erodeBinary(dilateBinary(fg, width, height, 2), width, height, 2);
+  const closed = fillMaskHoles(closedRaw, width, height);
   const grown = dilateBinary(closed, width, height, 4);
   return { closed, grown };
 }

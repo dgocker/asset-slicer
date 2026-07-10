@@ -9,6 +9,7 @@ import {
   Sparkles,
   Smartphone,
   FolderDown,
+  FolderOpen,
   Loader2,
   Settings,
   X,
@@ -26,6 +27,8 @@ import {
   estimateBackgroundColor,
   buildForegroundMask,
   dilateBinary,
+  erodeBinary,
+  fillMaskHoles,
 } from './utils/objectDetect';
 
 // Модель по умолчанию: BiRefNet_lite fp16 (ONNX opset 17), raw-режим по объектам
@@ -424,7 +427,10 @@ function getSheetBackgroundColor(img: HTMLImageElement): ColorRGB {
 
 /**
  * Fg-маска области rect в ПОЛНОМ разрешении по цвету фона листа
- * (maxChannelDiff > 25 — тот же критерий, что в автодетекции).
+ * (maxChannelDiff > 25 И отличие от локального размытия — тот же критерий,
+ * что в автодетекции). Локальный критерий оставляет от крупных однотонных
+ * объектов «кольцо», поэтому после лёгкого закрытия обязательно заливаем
+ * дыры (иначе интерьер объекта стал бы прозрачным).
  */
 function foregroundMaskForRect(
   img: HTMLImageElement,
@@ -435,10 +441,15 @@ function foregroundMaskForRect(
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) throw new Error('Canvas 2D context unavailable');
   const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const w = canvas.width;
+  const h = canvas.height;
+  const raw = buildForegroundMask(imgData, 25, sheetBg);
+  // Закрытие 5×5 склеивает разрывы «кольца», после чего дыры заливаются
+  const closed = erodeBinary(dilateBinary(raw, w, h, 2), w, h, 2);
   return {
-    data: buildForegroundMask(imgData, 25, sheetBg),
-    width: canvas.width,
-    height: canvas.height,
+    data: fillMaskHoles(closed, w, h),
+    width: w,
+    height: h,
   };
 }
 
@@ -575,6 +586,8 @@ export default function App() {
   const [exportFolder, setExportFolder] = useState<string>(() => {
     return localStorage.getItem('exportFolder') || 'Download';
   });
+  // Имя выбранной SAF-папки сохранения (null — не выбрана / права отозваны)
+  const [safFolderName, setSafFolderName] = useState<string | null>(null);
   const [modelDownloadProgress, setModelDownloadProgress] = useState<number | null>(null);
   const [isModelDownloading, setIsModelDownloading] = useState(false);
 
@@ -631,6 +644,41 @@ export default function App() {
       checkCustomModelCacheStatus();
     }
   }, [isSettingsOpen, customModelUrl, checkCustomModelCacheStatus]);
+
+  // При открытии настроек подтягиваем имя выбранной SAF-папки сохранения
+  useEffect(() => {
+    if (!isSettingsOpen || !Capacitor.isNativePlatform()) return;
+    let active = true;
+    // Явный выбор легаси-пути перекрывает ранее выбранную SAF-папку
+    const legacy = localStorage.getItem('downloadTarget') === 'legacy';
+    BackgroundRemoval.getExportFolder()
+      .then((res) => {
+        if (active) {
+          setSafFolderName(!legacy && res && res.uri ? res.name || 'Выбранная папка' : null);
+        }
+      })
+      .catch((e) => {
+        console.warn('getExportFolder failed:', e);
+        if (active) setSafFolderName(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isSettingsOpen]);
+
+  /** «Изменить» папку сохранения: системный пикер SAF (ACTION_OPEN_DOCUMENT_TREE). */
+  const handlePickExportFolder = useCallback(async () => {
+    try {
+      const res = await BackgroundRemoval.pickExportFolder();
+      if (res && res.uri) {
+        localStorage.setItem('downloadTarget', 'saf');
+        setSafFolderName(res.name || 'Выбранная папка');
+      }
+    } catch (e) {
+      // Пользователь закрыл пикер без выбора — ничего не меняем
+      console.warn('Export folder pick cancelled/failed:', e);
+    }
+  }, []);
 
   // Статусы кэша нужны и на главной (список моделей): обновляем на native
   useEffect(() => {
@@ -1895,6 +1943,24 @@ export default function App() {
                 </div>
 
                 <div className="space-y-3">
+                  {Capacitor.isNativePlatform() && (
+                    <div className="flex items-center justify-between gap-3 bg-zinc-950/60 border border-zinc-850 rounded-xl px-4 py-2.5">
+                      <span className="text-xs text-zinc-300 min-w-0 truncate">
+                        Папка сохранения:{' '}
+                        <span className="font-bold text-zinc-100">
+                          {safFolderName || `Documents/${exportFolder}`}
+                        </span>
+                      </span>
+                      <button
+                        onClick={handlePickExportFolder}
+                        className="shrink-0 flex items-center gap-1.5 py-2 px-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 rounded-xl text-[11px] font-bold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95"
+                        title="Выбрать папку сохранения ассетов (системный выбор папки)"
+                      >
+                        <FolderOpen className="w-3.5 h-3.5" />
+                        Изменить
+                      </button>
+                    </div>
+                  )}
                   <input
                     type="text"
                     value={exportFolder}
@@ -1906,7 +1972,7 @@ export default function App() {
                     className="w-full bg-zinc-950/60 border border-zinc-850 hover:border-zinc-750 focus:border-violet-500/80 focus:ring-[3px] focus:ring-violet-500/10 rounded-xl px-4 py-2.5 text-xs text-zinc-200 placeholder-zinc-650 transition-all duration-300 outline-none"
                   />
                   <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                    Все ассеты (PNG и WebP) сохраняются в указанную подпапку Android-директории <code className="text-violet-450 font-mono text-[10px] bg-violet-950/20 px-1 py-0.5 rounded border border-violet-900/30">Documents</code>.
+                    Если папка сохранения не выбрана (путь по умолчанию), ассеты (PNG и WebP) сохраняются в указанную подпапку Android-директории <code className="text-violet-450 font-mono text-[10px] bg-violet-950/20 px-1 py-0.5 rounded border border-violet-900/30">Documents</code>.
                   </p>
                 </div>
               </div>
