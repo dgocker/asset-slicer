@@ -25,6 +25,7 @@ import {
   Save,
   Loader2,
 } from 'lucide-react';
+import { useT, tGlobal } from '../i18n';
 
 interface AssetEditorProps {
   asset: {
@@ -84,8 +85,8 @@ const CHECKERBOARD_STYLE: React.CSSProperties = {
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
 const formatBytes = (bytes: number): string => {
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
-  return `${Math.max(1, Math.round(bytes / 1024))} КБ`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} ${tGlobal('units.mb')}`;
+  return `${Math.max(1, Math.round(bytes / 1024))} ${tGlobal('units.kb')}`;
 };
 
 const canvasToBlob = (canvas: HTMLCanvasElement, mime: string, quality?: number): Promise<Blob | null> =>
@@ -119,6 +120,7 @@ const renderResized = (src: HTMLCanvasElement, targetW: number, targetH: number)
 };
 
 const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSave, onClose }) => {
+  const { t } = useT();
   // ---------- DOM / рабочие холсты ----------
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -793,7 +795,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
   const handleClose = () => {
     const settingsChanged =
       format !== 'png' || exportW !== String(natural.w) || exportH !== String(natural.h);
-    if ((dirtyRef.current || settingsChanged) && !window.confirm('Выйти без сохранения?')) return;
+    if ((dirtyRef.current || settingsChanged) && !window.confirm(t('editor.confirmExit'))) return;
     onClose();
   };
 
@@ -820,7 +822,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
       {/* Шапка */}
       <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-zinc-800 bg-zinc-950/95 shrink-0">
         <div className="min-w-0">
-          <h2 className="text-sm font-extrabold text-zinc-100 tracking-tight truncate">Редактор ассета</h2>
+          <h2 className="text-sm font-extrabold text-zinc-100 tracking-tight truncate">{t('editor.title')}</h2>
           <p className="text-[10px] text-zinc-500 font-mono truncate">
             {asset.label} · {natural.w} × {natural.h} px
           </p>
@@ -829,7 +831,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
           type="button"
           onClick={handleClose}
           className="shrink-0 bg-zinc-900/80 hover:bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-white p-2 rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
-          title="Закрыть редактор"
+          title={t('editor.closeTitle')}
         >
           <X className="w-4 h-4" />
         </button>
@@ -859,7 +861,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
           <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/60 z-20">
             <div className="flex flex-col items-center gap-2 text-violet-300">
               <Loader2 className="w-7 h-7 animate-spin" />
-              <span className="text-[11px] font-semibold">Загрузка ассета...</span>
+              <span className="text-[11px] font-semibold">{t('editor.loading')}</span>
             </div>
           </div>
         )}
@@ -873,7 +875,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
               if (c) zoomAt({ x: c.clientWidth / 2, y: c.clientHeight / 2 }, 1.25);
             }}
             className="bg-zinc-950/80 backdrop-blur-md border border-zinc-800 text-zinc-300 hover:text-white p-2 rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
-            title="Приблизить"
+            title={t('editor.zoomIn')}
           >
             <ZoomIn className="w-4 h-4" />
           </button>
@@ -884,7 +886,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
               if (c) zoomAt({ x: c.clientWidth / 2, y: c.clientHeight / 2 }, 1 / 1.25);
             }}
             className="bg-zinc-950/80 backdrop-blur-md border border-zinc-800 text-zinc-300 hover:text-white p-2 rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
-            title="Отдалить"
+            title={t('editor.zoomOut')}
           >
             <ZoomOut className="w-4 h-4" />
           </button>
@@ -895,7 +897,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
               if (c) zoomAt({ x: c.clientWidth / 2, y: c.clientHeight / 2 }, 1 / viewRef.current.scale);
             }}
             className="bg-zinc-950/80 backdrop-blur-md border border-zinc-800 text-zinc-300 hover:text-white px-1.5 py-2 rounded-xl transition-all shadow-md active:scale-95 cursor-pointer text-[10px] font-mono font-bold"
-            title="Масштаб 100%"
+            title={t('editor.zoom100')}
           >
             1:1
           </button>
@@ -914,19 +916,19 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
                   onClick={handleApplyCrop}
                   className="py-2 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md cursor-pointer active:scale-95"
                 >
-                  Применить кадр
+                  {t('editor.applyCrop')}
                 </button>
                 <button
                   type="button"
                   onClick={handleResetCrop}
                   className="py-2 px-4 bg-zinc-950/80 backdrop-blur-md border border-zinc-800 text-zinc-300 hover:text-white rounded-xl text-xs font-semibold transition-all shadow-md cursor-pointer active:scale-95"
                 >
-                  Сброс
+                  {t('common.reset')}
                 </button>
               </>
             ) : (
               <span className="text-[11px] font-semibold text-zinc-300 bg-zinc-950/80 backdrop-blur-md border border-zinc-800 rounded-xl px-3 py-2 shadow-md">
-                Перетащите, чтобы выделить область
+                {t('editor.cropHint')}
               </span>
             )}
           </div>
@@ -938,12 +940,12 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
         {/* Инструменты */}
         <div>
           <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-1.5 block">
-            Инструменты
+            {t('editor.tools')}
           </label>
           <div className="grid grid-cols-7 gap-1.5">
-            <button type="button" onClick={() => setTool('erase')} className={toolBtnCls(tool === 'erase')} title="Ластик">
+            <button type="button" onClick={() => setTool('erase')} className={toolBtnCls(tool === 'erase')} title={t('editor.tool.erase')}>
               <Eraser className="w-4 h-4" />
-              Ластик
+              {t('editor.tool.erase')}
             </button>
             <button
               type="button"
@@ -952,25 +954,25 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
               }}
               disabled={transformed || !origReady}
               className={toolBtnCls(tool === 'restore', transformed || !origReady)}
-              title="Восстановить пиксели оригинала"
+              title={t('editor.tool.restoreTitle')}
             >
               <Paintbrush className="w-4 h-4" />
-              Восст.
+              {t('editor.tool.restore')}
             </button>
-            <button type="button" onClick={() => setTool('pan')} className={toolBtnCls(tool === 'pan')} title="Перемещение по холсту">
+            <button type="button" onClick={() => setTool('pan')} className={toolBtnCls(tool === 'pan')} title={t('editor.tool.panTitle')}>
               <Hand className="w-4 h-4" />
-              Рука
+              {t('editor.tool.pan')}
             </button>
-            <button type="button" onClick={() => setTool('crop')} className={toolBtnCls(tool === 'crop')} title="Кадрировать">
+            <button type="button" onClick={() => setTool('crop')} className={toolBtnCls(tool === 'crop')} title={t('editor.tool.cropTitle')}>
               <Crop className="w-4 h-4" />
-              Кадр
+              {t('editor.tool.crop')}
             </button>
             <button
               type="button"
               onClick={handleRotate}
               disabled={!ready}
               className={toolBtnCls(false, !ready)}
-              title="Повернуть на 90° по часовой"
+              title={t('editor.tool.rotateTitle')}
             >
               <RotateCw className="w-4 h-4" />
               90°
@@ -980,25 +982,25 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
               onClick={handleUndo}
               disabled={!canUndo}
               className={toolBtnCls(false, !canUndo)}
-              title="Отменить (undo)"
+              title={t('editor.tool.undoTitle')}
             >
               <Undo2 className="w-4 h-4" />
-              Назад
+              {t('editor.tool.undo')}
             </button>
             <button
               type="button"
               onClick={handleRedo}
               disabled={!canRedo}
               className={toolBtnCls(false, !canRedo)}
-              title="Повторить (redo)"
+              title={t('editor.tool.redoTitle')}
             >
               <Redo2 className="w-4 h-4" />
-              Вперёд
+              {t('editor.tool.redo')}
             </button>
           </div>
           {transformed && (
             <p className="text-[10px] text-zinc-500 leading-normal mt-1.5">
-              «Восстановить» отключено: после кадрирования, поворота или изменения размера соответствие пикселей оригинальному листу потеряно.
+              {t('editor.restoreDisabledNote')}
             </p>
           )}
         </div>
@@ -1007,7 +1009,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
         {isBrushTool && (
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500">Размер кисти</label>
+              <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500">{t('editor.brushSize')}</label>
               <span className="text-[10px] font-mono font-bold text-violet-300">{brushSize} px</span>
             </div>
             <input
@@ -1023,7 +1025,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
 
         {/* Размер */}
         <div>
-          <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-1.5 block">Размер</label>
+          <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-1.5 block">{t('editor.size')}</label>
           <div className="flex items-center gap-2">
             <input
               type="number"
@@ -1031,7 +1033,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
               value={exportW}
               onChange={(e) => handleWidthChange(e.target.value)}
               className={numInputCls}
-              title="Ширина, px"
+              title={t('editor.widthTitle')}
             />
             <span className="text-zinc-500 text-xs font-bold shrink-0">×</span>
             <input
@@ -1040,7 +1042,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
               value={exportH}
               onChange={(e) => handleHeightChange(e.target.value)}
               className={numInputCls}
-              title="Высота, px (пропорция залочена)"
+              title={t('editor.heightTitle')}
             />
           </div>
           <div className="grid grid-cols-6 gap-1.5 mt-2">
@@ -1060,7 +1062,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
         {/* Формат */}
         <div>
           <div className="flex items-center justify-between mb-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500">Формат</label>
+            <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-500">{t('editor.format')}</label>
             <span className="text-[10px] font-mono font-bold text-zinc-400 flex items-center gap-1.5">
               {estBusy ? (
                 <Loader2 className="w-3 h-3 animate-spin text-violet-400" />
@@ -1092,7 +1094,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
           {format === 'webp' && (
             <div className="mt-2">
               <div className="flex items-center justify-between mb-1.5">
-                <span className="text-[10px] font-bold text-zinc-500">Качество</span>
+                <span className="text-[10px] font-bold text-zinc-500">{t('common.quality')}</span>
                 <span className="text-[10px] font-mono font-bold text-violet-300">{quality}</span>
               </div>
               <input
@@ -1114,7 +1116,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
             onClick={handleClose}
             className="flex-1 py-2.5 px-4 bg-zinc-900/60 hover:bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-xl text-xs font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95"
           >
-            Отмена
+            {t('common.cancel')}
           </button>
           <button
             type="button"
@@ -1123,7 +1125,7 @@ const AssetEditor: React.FC<AssetEditorProps> = ({ asset, originalImageSrc, onSa
             className="flex-[2] flex items-center justify-center gap-1.5 py-2.5 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:from-zinc-800 disabled:to-zinc-800 disabled:text-zinc-500 text-white rounded-xl text-xs font-bold transition-all shadow-[0_4px_12px_rgba(124,58,237,0.25)] cursor-pointer active:scale-95 disabled:cursor-not-allowed"
           >
             {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-            {saving ? 'Сохранение...' : 'Сохранить'}
+            {saving ? t('editor.saving') : t('editor.save')}
           </button>
         </div>
       </div>

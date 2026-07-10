@@ -13,6 +13,12 @@
 Стек: React + TypeScript + Vite и Capacitor (Android). Инференс выполняется нативно
 через ONNX Runtime.
 
+## Скриншоты
+
+| Выбор модели | Выбор объектов | Галерея ассетов |
+|---|---|---|
+| ![Главный экран](docs/screenshots/main.jpg) | ![Выбор объектов](docs/screenshots/selector.jpg) | ![Галерея](docs/screenshots/gallery.jpg) |
+
 ## Возможности
 
 - **Выбор объектов на листе** — автоматическая детекция, ручные рамки, прилипание к
@@ -81,8 +87,6 @@ src/
 android/
   .../BackgroundRemovalPlugin.kt  # инференс на ONNX Runtime (CPU EP), докачка
                                   # моделей, raw-режим маски
-tools/
-  pipeline.py             # python-эталон нативного конвейера обработки
 ```
 
 ## Замечание о безопасности

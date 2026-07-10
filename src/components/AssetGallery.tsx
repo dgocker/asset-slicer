@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { ObjectAsset } from '../types';
+import { useT, tGlobal } from '../i18n';
 
 interface AssetGalleryProps {
   assets: ObjectAsset[];
@@ -114,7 +115,7 @@ async function encodeBlobForDownload(
   const mime = format === 'webp' ? 'image/webp' : 'image/png';
   const out = await new Promise<Blob>((resolve, reject) =>
     canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error('Не удалось перекодировать ассет'))),
+      (b) => (b ? resolve(b) : reject(new Error(tGlobal('gallery.encodeError')))),
       mime,
       format === 'webp' ? quality / 100 : undefined,
     ),
@@ -147,6 +148,7 @@ export default function AssetGallery({
   onBackToSelector,
   onEdit,
 }: AssetGalleryProps) {
+  const { t } = useT();
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [isDownloadingAll, setIsDownloadingAll] = useState(false);
 
@@ -253,12 +255,12 @@ export default function AssetGallery({
       await downloadAssetBlob(`${sanitizeFileName(asset.label)}.${blobExt(out)}`, out);
     } catch (e) {
       if (isNoFolderError(e)) {
-        alert('Папка сохранения недоступна. Выберите папку заново.');
+        alert(t('gallery.folderUnavailable'));
         handleNoFolderError();
         return;
       }
       console.error('Asset download failed:', e);
-      alert('Ошибка при скачивании файла: ' + String(e));
+      alert(t('gallery.downloadError', { error: String(e) }));
     } finally {
       setDownloadingId(null);
     }
@@ -288,20 +290,20 @@ export default function AssetGallery({
       }
       if (Capacitor.isNativePlatform() && savedCount > 0) {
         if (localStorage.getItem('downloadTarget') === 'saf') {
-          alert(`Сохранено файлов: ${savedCount} (в выбранную папку)`);
+          alert(t('gallery.savedToPicked', { n: savedCount }));
         } else {
           const exportFolder = localStorage.getItem('exportFolder') || 'Download';
-          alert(`Сохранено файлов: ${savedCount} (Documents/${exportFolder}/)`);
+          alert(t('gallery.savedToLegacy', { n: savedCount, folder: exportFolder }));
         }
       }
     } catch (e) {
       if (isNoFolderError(e)) {
-        alert('Папка сохранения недоступна. Выберите папку заново.');
+        alert(t('gallery.folderUnavailable'));
         handleNoFolderError();
         return;
       }
       console.error('Download all failed:', e);
-      alert('Ошибка при скачивании файлов: ' + String(e));
+      alert(t('gallery.downloadAllError', { error: String(e) }));
     } finally {
       setIsDownloadingAll(false);
     }
@@ -317,12 +319,11 @@ export default function AssetGallery({
               <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-violet-600 to-indigo-600 flex items-center justify-center shadow-md">
                 <Images className="w-4 h-4 text-white" />
               </div>
-              Галерея готовых ассетов
+              {t('gallery.title')}
             </h3>
             <p className="text-xs text-zinc-400 mt-1.5 leading-relaxed max-w-xl">
-              Каждый объект вырезан нейросетью отдельно и обрезан по границам
-              непрозрачных пикселей. Готово: {doneAssets.length} из {assets.length}
-              {errorCount > 0 ? `, с ошибкой: ${errorCount}` : ''}.
+              {t('gallery.subtitle', { done: doneAssets.length, total: assets.length })}
+              {errorCount > 0 ? t('gallery.subtitleErrors', { n: errorCount }) : ''}.
             </p>
           </div>
 
@@ -332,10 +333,10 @@ export default function AssetGallery({
               onClick={onBackToSelector}
               disabled={isProcessing}
               className="flex items-center gap-1.5 py-2.5 px-4 bg-zinc-950/60 hover:bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-xl text-xs font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Вернуться к выбору объектов (рамки сохранятся)"
+              title={t('gallery.backTitle')}
             >
               <ArrowLeft className="w-3.5 h-3.5" />
-              К выбору объектов
+              {t('gallery.backToSelector')}
             </button>
             <button
               onClick={handleDownloadAll}
@@ -347,7 +348,7 @@ export default function AssetGallery({
               ) : (
                 <FolderDown className="w-3.5 h-3.5" />
               )}
-              Скачать все ({doneAssets.length})
+              {t('gallery.downloadAll', { n: doneAssets.length })}
             </button>
           </div>
         </div>
@@ -355,7 +356,7 @@ export default function AssetGallery({
         {/* Download format panel (applies to single and batch download) */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5 bg-zinc-950/40 border border-zinc-800/80 rounded-2xl px-4 py-2.5">
           <span className="text-[10px] font-extrabold uppercase tracking-wider text-zinc-500 shrink-0">
-            Формат скачивания
+            {t('gallery.downloadFormat')}
           </span>
           <div className="flex gap-1 bg-zinc-900/60 border border-zinc-800 rounded-xl p-1">
             <button
@@ -383,7 +384,7 @@ export default function AssetGallery({
           </div>
           {downloadFormat === 'webp' && (
             <div className="flex items-center gap-2.5 flex-1 min-w-[170px] max-w-xs">
-              <span className="text-[10px] font-bold text-zinc-500 shrink-0">Качество</span>
+              <span className="text-[10px] font-bold text-zinc-500 shrink-0">{t('common.quality')}</span>
               <input
                 type="range"
                 min="10"
@@ -421,7 +422,7 @@ export default function AssetGallery({
         {/* Cards grid */}
         {assets.length === 0 ? (
           <div className="w-full bg-zinc-950/40 border border-zinc-800/80 rounded-2xl p-10 text-center text-zinc-400 text-xs">
-            Нет обработанных объектов. Вернитесь к выбору объектов и отметьте рамки.
+            {t('gallery.empty')}
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
@@ -447,18 +448,18 @@ export default function AssetGallery({
                     <div className="relative z-10 flex flex-col items-center gap-2 text-red-400 px-4 text-center">
                       <AlertTriangle className="w-7 h-7" />
                       <span className="text-[11px] font-semibold leading-snug">
-                        {asset.error || 'Ошибка обработки'}
+                        {asset.error || t('gallery.processingError')}
                       </span>
                     </div>
                   ) : asset.status === 'processing' ? (
                     <div className="relative z-10 flex flex-col items-center gap-2 text-violet-300">
                       <Loader2 className="w-7 h-7 animate-spin" />
-                      <span className="text-[11px] font-semibold">Обработка...</span>
+                      <span className="text-[11px] font-semibold">{t('common.processing')}</span>
                     </div>
                   ) : (
                     <div className="relative z-10 flex flex-col items-center gap-2 text-zinc-500">
                       <Hourglass className="w-6 h-6" />
-                      <span className="text-[11px] font-semibold">В очереди</span>
+                      <span className="text-[11px] font-semibold">{t('gallery.queued')}</span>
                     </div>
                   )}
                 </div>
@@ -470,7 +471,7 @@ export default function AssetGallery({
                   onChange={(e) => onRename(asset.id, e.target.value)}
                   spellCheck={false}
                   className="w-full text-xs font-semibold text-zinc-100 bg-zinc-900/60 focus:bg-zinc-900 border border-zinc-800 focus:border-violet-500/50 rounded-xl px-3 py-2 outline-none transition-all"
-                  title="Название ассета (имя файла при скачивании)"
+                  title={t('gallery.labelTitle')}
                 />
 
                 {/* Note badge (нестандартный путь обработки, напр. фолбэк без ИИ) */}
@@ -486,7 +487,10 @@ export default function AssetGallery({
                   <span className="text-[10px] font-mono font-semibold text-zinc-400">
                     {asset.status === 'done'
                       ? `${asset.width} × ${asset.height} px`
-                      : `рамка ${Math.round(asset.rect.width)} × ${Math.round(asset.rect.height)} px`}
+                      : t('gallery.boxSize', {
+                          w: Math.round(asset.rect.width),
+                          h: Math.round(asset.rect.height),
+                        })}
                   </span>
 
                   {asset.status === 'done' && asset.blob && (
@@ -495,10 +499,10 @@ export default function AssetGallery({
                         onClick={() => onEdit(asset.id)}
                         disabled={busy}
                         className="flex items-center gap-1.5 py-2 px-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 rounded-xl text-[11px] font-bold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-                        title="Открыть ассет в редакторе (ластик, восстановление, кроп, формат)"
+                        title={t('gallery.editTitle')}
                       >
                         <PencilRuler className="w-3.5 h-3.5" />
-                        Редактировать
+                        {t('gallery.edit')}
                       </button>
                       <button
                         onClick={() => handleDownloadOne(asset)}
@@ -510,7 +514,7 @@ export default function AssetGallery({
                         ) : (
                           <Download className="w-3.5 h-3.5" />
                         )}
-                        Скачать
+                        {t('common.download')}
                       </button>
                     </div>
                   )}
@@ -522,7 +526,7 @@ export default function AssetGallery({
                       className="flex items-center gap-1.5 py-2 px-3.5 bg-red-950/20 hover:bg-red-950/40 border border-red-900/40 hover:border-red-800/60 rounded-xl text-[11px] font-bold text-red-400 hover:text-red-300 transition-all cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <RefreshCw className="w-3.5 h-3.5" />
-                      Повторить
+                      {t('gallery.retry')}
                     </button>
                   )}
                 </div>
@@ -541,12 +545,11 @@ export default function AssetGallery({
                 <FolderOpen className="w-4 h-4 text-white" />
               </div>
               <h3 className="font-extrabold text-zinc-100 text-sm tracking-tight">
-                Куда сохранять ассеты?
+                {t('gallery.folderModal.title')}
               </h3>
             </div>
             <p className="text-xs text-zinc-400 leading-relaxed">
-              Выберите папку на устройстве — все скачанные ассеты будут
-              сохраняться в неё. Изменить выбор можно в настройках.
+              {t('gallery.folderModal.body')}
             </p>
             <button
               onClick={handlePickFolder}
@@ -558,20 +561,20 @@ export default function AssetGallery({
               ) : (
                 <FolderOpen className="w-4 h-4" />
               )}
-              Выбрать папку
+              {t('gallery.folderModal.pick')}
             </button>
             <button
               onClick={handleUseLegacyFolder}
               className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-zinc-950/60 hover:bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-xl text-xs font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-[0.98]"
             >
               <FolderDown className="w-4 h-4" />
-              Documents/Download (по умолчанию)
+              {t('gallery.folderModal.legacy')}
             </button>
             <button
               onClick={() => closeFolderModal(false)}
               className="w-full py-2 text-[11px] font-semibold text-zinc-500 hover:text-zinc-300 transition-all cursor-pointer"
             >
-              Отмена
+              {t('common.cancel')}
             </button>
           </div>
         </div>

@@ -13,7 +13,8 @@ import {
   Loader2,
   Settings,
   X,
-  Trash2
+  Trash2,
+  Globe
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { ColorRGB, Rect, ObjectAsset, SelectionItem, SelectionMask } from './types';
@@ -22,6 +23,7 @@ import ObjectSelector from './components/ObjectSelector';
 import AssetGallery from './components/AssetGallery';
 import AssetEditor from './components/AssetEditor';
 import { BackgroundRemoval } from './plugins/backgroundRemoval';
+import { useT, tGlobal, I18nKey } from './i18n';
 import {
   clampRectToBounds,
   estimateBackgroundColor,
@@ -49,39 +51,57 @@ const getSha256ForUrl = (url: string): string | undefined =>
 
 const formatMb = (bytes: number): number => Math.round(bytes / (1024 * 1024));
 
-/** ИИ-обработка работает только в нативном приложении (onnxruntime на устройстве). */
-const WEB_AI_UNSUPPORTED_MESSAGE =
-  'Обработка доступна в мобильном приложении (Android). Соберите APK или скачайте его из релизов.';
-
 interface SavedModel {
   name: string;
   url: string;
   sizeLabel: string;
   isPreset: boolean;
-  description: string;
+  /** Ключ локализованного описания (пресеты и новые пользовательские модели). */
+  descriptionKey?: string;
+  /**
+   * Легаси: старые пользовательские модели из localStorage хранят описание
+   * строкой — показывается как есть (fallback, не ломаем сохранённые списки).
+   */
+  description?: string;
+  /** Локализуемый квалификатор в скобках после имени («Рекомендуется» и т.п.). */
+  nameSuffixKey?: string;
 }
+
+type TFn = (key: I18nKey, vars?: Record<string, string | number>) => string;
+
+/** Описание модели с учётом локализации и легаси-строк. */
+const modelDescription = (model: SavedModel, t: TFn): string =>
+  model.descriptionKey ? t(model.descriptionKey as I18nKey) : model.description || '';
+
+/** Имя модели: бренд как есть + локализованный квалификатор в скобках. */
+const modelDisplayName = (model: SavedModel, t: TFn): string =>
+  model.nameSuffixKey
+    ? `${model.name} (${t(model.nameSuffixKey as I18nKey)})`
+    : model.name;
 
 const DEFAULT_PRESETS: SavedModel[] = [
   {
-    name: 'BiRefNet-lite fp16 (Рекомендуется)',
+    name: 'BiRefNet-lite fp16',
     url: BIREFNET_MODEL_URL,
-    sizeLabel: '109 МБ',
+    sizeLabel: '109 MB',
     isPreset: true,
-    description: 'Точная модель для вырезания объектов по отдельности. Скачивается с докачкой и проверкой контрольной суммы.'
+    nameSuffixKey: 'models.tag.recommended',
+    descriptionKey: 'models.birefnetLite.desc'
   },
   {
-    name: 'BiRefNet base fp16 (Качество)',
+    name: 'BiRefNet base fp16',
     url: BIREFNET_BASE_MODEL_URL,
-    sizeLabel: '467 МБ',
+    sizeLabel: '467 MB',
     isPreset: true,
-    description: 'Полный Swin-Large: берёт мелкие и бледные объекты, которые lite пропускает. В 4–6 раз медленнее и требует много памяти — для мощных телефонов (8+ ГБ ОЗУ). Докачка и проверка суммы включены.'
+    nameSuffixKey: 'models.tag.quality',
+    descriptionKey: 'models.birefnetBase.desc'
   },
   {
     name: 'U2Netp (Lightweight)',
     url: 'https://huggingface.co/nicjac/u2netp-onnx/resolve/main/u2netp.onnx',
-    sizeLabel: '4.4 МБ',
+    sizeLabel: '4.4 MB',
     isPreset: true,
-    description: 'Суперлегкая модель. Мгновенно скачивается, работает быстро и потребляет минимум оперативной памяти.'
+    descriptionKey: 'models.u2netp.desc'
   }
 ];
 
@@ -507,9 +527,10 @@ const revokeAssetUrls = (list: ObjectAsset[]) => {
 };
 
 export default function App() {
+  const { t, lang, setLang } = useT();
   const [originalImageSrc, setOriginalImageSrc] = useState<string | null>(null);
   const [useAIBgRemoval, setUseAIBgRemoval] = useState(true);
-  const [aiProgress, setAiProgress] = useState<string>('Инициализация...');
+  const [aiProgress, setAiProgress] = useState<string>(() => tGlobal('progress.init'));
   const [aiPercent, setAiPercent] = useState<number>(0);
 
   // Стейт-машина экранов основного потока
@@ -594,7 +615,15 @@ export default function App() {
   const [modelsList, setModelsList] = useState<SavedModel[]>(() => {
     const saved = localStorage.getItem('user_models_list');
     if (saved) {
-      try { return JSON.parse(saved); } catch (e) {}
+      try {
+        const parsed: SavedModel[] = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // Пресеты из старых сохранений (с русской description-строкой)
+          // подменяем актуальными объектами с descriptionKey; пользовательские
+          // модели остаются как есть (их description показывается строкой)
+          return parsed.map(m => DEFAULT_PRESETS.find(p => p.url === m.url) ?? m);
+        }
+      } catch (e) {}
     }
     return DEFAULT_PRESETS;
   });
@@ -633,9 +662,9 @@ export default function App() {
       const res = await BackgroundRemoval.clearCachedModels();
       setIsCustomModelCached(false);
       await checkCustomModelCacheStatus();
-      alert(`Кэш очищен. Удалено файлов моделей: ${res.deletedCount}`);
+      alert(tGlobal('app.cacheCleared', { count: res.deletedCount }));
     } catch (e) {
-      alert('Ошибка при очистке кэша: ' + String(e));
+      alert(tGlobal('app.cacheClearError', { error: String(e) }));
     }
   };
 
@@ -654,7 +683,7 @@ export default function App() {
     BackgroundRemoval.getExportFolder()
       .then((res) => {
         if (active) {
-          setSafFolderName(!legacy && res && res.uri ? res.name || 'Выбранная папка' : null);
+          setSafFolderName(!legacy && res && res.uri ? res.name || tGlobal('app.pickedFolder') : null);
         }
       })
       .catch((e) => {
@@ -672,7 +701,7 @@ export default function App() {
       const res = await BackgroundRemoval.pickExportFolder();
       if (res && res.uri) {
         localStorage.setItem('downloadTarget', 'saf');
-        setSafFolderName(res.name || 'Выбранная папка');
+        setSafFolderName(res.name || tGlobal('app.pickedFolder'));
       }
     } catch (e) {
       // Пользователь закрыл пикер без выбора — ничего не меняем
@@ -702,9 +731,7 @@ export default function App() {
     // может вылетать — честно предупреждаем до выбора
     const memGB = deviceMemGBRef.current;
     if (url === BIREFNET_BASE_MODEL_URL && memGB > 0 && memGB < 5.5) {
-      const ok = window.confirm(
-        `На устройстве ${memGB.toFixed(1)} ГБ ОЗУ. Модель «Качество» (467 МБ) требует 6+ ГБ и может вылетать. Продолжить?`
-      );
+      const ok = window.confirm(tGlobal('app.lowMemWarning', { gb: memGB.toFixed(1) }));
       if (!ok) return;
     }
     setCustomModelUrl(url);
@@ -728,7 +755,7 @@ export default function App() {
     }
 
     const totalFallback = customModelUrl === BIREFNET_MODEL_URL ? BIREFNET_MODEL_SIZE_BYTES : customModelUrl === BIREFNET_BASE_MODEL_URL ? BIREFNET_BASE_MODEL_SIZE_BYTES : 0;
-    setAiProgress('Загрузка модели ИИ...');
+    setAiProgress(tGlobal('progress.modelDownloadStart'));
     setAiPercent(0);
 
     const listener = await BackgroundRemoval.addListener(
@@ -737,13 +764,20 @@ export default function App() {
         if (!info || typeof info.loaded !== 'number') return;
         const total = info.total > 0 ? info.total : totalFallback;
         setModelFetchInfo({ loaded: info.loaded, total, resumed: !!info.resumed });
+        const resumedSuffix = info.resumed ? tGlobal('progress.resumedSuffix') : '';
         if (total > 0) {
           setAiProgress(
-            `Загрузка модели… ${formatMb(info.loaded)} / ${formatMb(total)} МБ${info.resumed ? ' (докачка)' : ''}`
+            tGlobal('progress.modelDownloadMb', {
+              loaded: formatMb(info.loaded),
+              total: formatMb(total),
+            }) + resumedSuffix
           );
           setAiPercent(Math.max(0, Math.min(100, Math.round((info.loaded / total) * 100))));
         } else {
-          setAiProgress(`Загрузка модели… ${formatMb(info.loaded)} МБ${info.resumed ? ' (докачка)' : ''}`);
+          setAiProgress(
+            tGlobal('progress.modelDownloadMbNoTotal', { loaded: formatMb(info.loaded) }) +
+              resumedSuffix
+          );
         }
       }
     );
@@ -821,7 +855,7 @@ export default function App() {
   /** Прогоняет ИИ-удаление фона по canvas (нативный raw-режим) → PNG-blob. */
   const runAIOnCanvas = useCallback(async (cropCanvas: HTMLCanvasElement): Promise<Blob> => {
     if (!Capacitor.isNativePlatform()) {
-      throw new Error(WEB_AI_UNSUPPORTED_MESSAGE);
+      throw new Error(tGlobal('app.webAiUnsupported'));
     }
     const cropDataUrl = cropCanvas.toDataURL('image/png');
     const result = await BackgroundRemoval.removeBackground({
@@ -831,7 +865,7 @@ export default function App() {
     });
     const response = await fetch(Capacitor.convertFileSrc(result.uri));
     if (!response.ok) {
-      throw new Error(`Не удалось прочитать результат ИИ (HTTP ${response.status})`);
+      throw new Error(tGlobal('app.aiReadError', { status: response.status }));
     }
     return response.blob();
   }, [customModelUrl]);
@@ -1021,14 +1055,14 @@ export default function App() {
       if (colorResult) {
         // При выключенном ИИ вырез по цвету — штатный путь, пометка не нужна
         return useAIBgRemoval
-          ? { ...colorResult, note: 'ИИ не нашёл объект — вырезано по цвету фона' }
+          ? { ...colorResult, note: tGlobal('app.noteColorFallback') }
           : colorResult;
       }
     }
 
     // --- Шаг 4: всё пусто ---
     throw new Error(
-      useAIBgRemoval ? 'ИИ вернул пустой результат' : 'Объект не найден по цвету фона'
+      useAIBgRemoval ? tGlobal('app.aiEmptyResult') : tGlobal('app.colorEmptyResult')
     );
   }, [useAIBgRemoval, runAIOnCanvas, getRegionAICanvas]);
 
@@ -1048,13 +1082,13 @@ export default function App() {
     // ИИ-обработка есть только в нативном приложении: в браузере сразу
     // объясняем это пользователю (вырез по цвету фона без ИИ работает и в вебе)
     if (!Capacitor.isNativePlatform() && useAIBgRemoval) {
-      alert(WEB_AI_UNSUPPORTED_MESSAGE);
+      alert(tGlobal('app.webAiUnsupported'));
       return;
     }
 
     const requestId = ++imageLoadRequestIdRef.current;
     setView('processing');
-    setAiProgress('Подготовка...');
+    setAiProgress(tGlobal('progress.preparing'));
     setAiPercent(0);
 
     try {
@@ -1090,7 +1124,7 @@ export default function App() {
       const stamp = Date.now();
       const pendingAssets: ObjectAsset[] = clampedSelections.map((sel, i) => ({
         id: `obj-${stamp}-${i}`,
-        label: options.labels?.[i] ?? `Объект ${i + 1}`,
+        label: options.labels?.[i] ?? tGlobal('asset.objectN', { n: i + 1 }),
         rect: sel.rect,
         blob: null,
         displayUrl: null,
@@ -1116,7 +1150,7 @@ export default function App() {
         if (requestId !== imageLoadRequestIdRef.current) return;
         const assetId = pendingAssets[i].id;
 
-        setAiProgress(`Объект ${i + 1} из ${clampedSelections.length}`);
+        setAiProgress(tGlobal('progress.objectOfN', { i: i + 1, n: clampedSelections.length }));
         setAiPercent(Math.round((i / clampedSelections.length) * 100));
         setObjectAssets(prev => prev.map(a =>
           a.id === assetId ? { ...a, status: 'processing' as const } : a
@@ -1161,7 +1195,7 @@ export default function App() {
       // Пост-проход «Исключать вложенные»: по ГОТОВОЙ альфе вложенного объекта
       // (маска цвета для белого-на-белом пуста — реальная альфа надёжнее)
       if (options.excludeNested) {
-        setAiProgress('Исключение вложенных объектов...');
+        setAiProgress(tGlobal('progress.excludingNested'));
         for (let a = 0; a < clampedSelections.length; a++) {
           const resA = runResults[a];
           if (!resA) continue;
@@ -1268,9 +1302,9 @@ export default function App() {
       console.error('Per-object AI processing failed:', error);
       const errMsg = error?.message || String(error);
       if (errMsg.includes('Model not preloaded')) {
-        alert('Модель ИИ не загружена. Пожалуйста, откройте настройки и скачайте модель.');
+        alert(tGlobal('app.modelNotLoaded'));
       } else {
-        alert('Обработка объектов не удалась: ' + errMsg);
+        alert(tGlobal('app.processObjectsFailed', { error: errMsg }));
       }
       // Возвращаемся на экран выбора объектов
       setView('selecting');
@@ -1293,11 +1327,11 @@ export default function App() {
       const img = await loadImage(dataUrl);
       await processObjects(
         [{ rect: { x: 0, y: 0, width: img.naturalWidth, height: img.naturalHeight } }],
-        { excludeNested: false, labels: ['Весь лист'] }
+        { excludeNested: false, labels: [tGlobal('asset.wholeSheet')] }
       );
     } catch (error: any) {
       console.error('Whole-sheet processing failed:', error);
-      alert('Обработка листа не удалась: ' + (error?.message || String(error)));
+      alert(tGlobal('app.processSheetFailed', { error: error?.message || String(error) }));
       setView('selecting');
     }
   }, [originalImageSrc, processObjects]);
@@ -1311,7 +1345,7 @@ export default function App() {
 
     const requestId = imageLoadRequestIdRef.current;
     const oldDisplayUrl = target.displayUrl;
-    setAiProgress(`Повторная обработка: ${target.label}`);
+    setAiProgress(tGlobal('progress.retrying', { label: target.label }));
     setAiPercent(0);
     setObjectAssets(prev => prev.map(a =>
       a.id === assetId
@@ -1441,7 +1475,7 @@ export default function App() {
 
   const preloadLocalModel = async () => {
     if (!Capacitor.isNativePlatform()) {
-      alert(WEB_AI_UNSUPPORTED_MESSAGE);
+      alert(tGlobal('app.webAiUnsupported'));
       return;
     }
     setIsModelDownloading(true);
@@ -1481,10 +1515,10 @@ export default function App() {
       await checkCustomModelCacheStatus();
       setIsModelDownloading(false);
       setModelDownloadProgress(null);
-      alert('Модель ИИ успешно загружена и кэширована!');
+      alert(tGlobal('app.modelDownloadDone'));
     } catch (err) {
       console.error('Failed to preload local model:', err);
-      alert('Ошибка при загрузке модели: ' + String((err as any).message || err));
+      alert(tGlobal('app.modelDownloadError', { error: String((err as any).message || err) }));
       setIsModelDownloading(false);
       setModelDownloadProgress(null);
     } finally {
@@ -1503,7 +1537,8 @@ export default function App() {
     ? objectAssets.find(a => a.id === editingAssetId && a.status === 'done' && a.blob) ?? null
     : null;
 
-  const clearCacheConfirmed = clearCacheInput.trim().toUpperCase() === 'УДАЛИТЬ';
+  const clearCacheConfirmed =
+    clearCacheInput.trim().toUpperCase() === t('clearCache.confirmWord');
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-violet-500/30 selection:text-violet-250">
@@ -1517,10 +1552,10 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-extrabold text-zinc-100 text-sm sm:text-base leading-tight tracking-tight">
-                Нарезка ассетов
+                {t('header.title')}
               </h1>
               <p className="text-[10px] text-zinc-400 font-semibold tracking-wider uppercase">
-                AI ASSET CUTTER
+                {t('header.subtitle')}
               </p>
             </div>
           </div>
@@ -1528,9 +1563,17 @@ export default function App() {
           {/* Actions & Stats */}
           <div className="flex items-center gap-3">
             <button
+              onClick={() => setLang(lang === 'ru' ? 'en' : 'ru')}
+              className="flex items-center gap-1.5 p-2.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/80 border border-zinc-800/50 hover:border-zinc-700/80 rounded-2xl transition-all duration-300 shadow-md active:scale-95 cursor-pointer"
+              title={t('header.langTitle')}
+            >
+              <Globe className="w-5 h-5" />
+              <span className="text-[10px] font-extrabold uppercase tracking-wider">{lang}</span>
+            </button>
+            <button
               onClick={() => setIsSettingsOpen(true)}
               className="p-2.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/80 border border-zinc-800/50 hover:border-zinc-700/80 rounded-2xl transition-all duration-300 shadow-md active:scale-95 cursor-pointer"
-              title="Настройки ИИ и скачивания"
+              title={t('header.settingsTitle')}
             >
               <Settings className="w-5 h-5" />
             </button>
@@ -1570,16 +1613,16 @@ export default function App() {
               </div>
               <p className="text-zinc-400 text-sm max-w-xs text-center leading-relaxed">
                 {modelFetchInfo
-                  ? 'Модель ИИ скачивается на устройство. Прерванная загрузка продолжится с того же места (докачка).'
-                  : 'Локальная нейросеть вырезает фон прямо на устройстве, офлайн. Изображения никуда не отправляются.'}
+                  ? t('processing.downloadHint')
+                  : t('processing.offlineHint')}
               </p>
               <button
                 onClick={handleCancelProcessing}
                 className="mt-6 flex items-center gap-1.5 py-2.5 px-5 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 rounded-xl text-xs font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95"
-                title="Прервать обработку и вернуться назад"
+                title={t('processing.cancelTitle')}
               >
                 <X className="w-3.5 h-3.5" />
-                Отменить
+                {t('processing.cancel')}
               </button>
             </div>
           ) : view === 'selecting' && originalImageSrc ? (
@@ -1613,13 +1656,13 @@ export default function App() {
               <div className="text-center max-w-2xl mb-10">
                 <div className="inline-flex items-center gap-2 bg-zinc-900/80 border border-zinc-800 text-violet-400 font-semibold text-xs rounded-full px-4 py-2 mb-5 shadow-lg shadow-black/10">
                   <Sparkles className="w-3.5 h-3.5 text-violet-400 animate-pulse" />
-                  Оптимизировано для мобильных телефонов
+                  {t('intro.badge')}
                 </div>
                 <h2 className="text-2xl sm:text-4xl font-extrabold text-white tracking-tight leading-tight px-4 bg-clip-text bg-gradient-to-b from-white to-zinc-300">
-                  Вырезайте ассеты из любого листа за секунды
+                  {t('intro.title')}
                 </h2>
                 <p className="text-zinc-400 text-sm sm:text-base mt-3.5 px-6 leading-relaxed max-w-xl mx-auto">
-                  Загрузите лист с иконками, логотипами или графикой — ИИ вырежет каждый объект отдельно, с прозрачным фоном и аккуратной обрезкой.
+                  {t('intro.subtitle')}
                 </p>
               </div>
 
@@ -1641,22 +1684,22 @@ export default function App() {
                 <div className="flex items-start gap-3 bg-zinc-900/20 border border-zinc-900/50 rounded-2xl p-4">
                   <div className="w-7 h-7 rounded-full bg-zinc-900 text-violet-400 border border-zinc-800 font-bold text-xs flex items-center justify-center shrink-0 shadow-inner">1</div>
                   <div>
-                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Загрузите лист</h5>
-                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">Сделайте фото или выберите картинку с объектами из галереи.</p>
+                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">{t('intro.step1.title')}</h5>
+                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">{t('intro.step1.text')}</p>
                   </div>
                 </div>
                 <div className="flex items-start gap-3 bg-zinc-900/20 border border-zinc-900/50 rounded-2xl p-4">
                   <div className="w-7 h-7 rounded-full bg-zinc-900 text-violet-400 border border-zinc-800 font-bold text-xs flex items-center justify-center shrink-0 shadow-inner">2</div>
                   <div>
-                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Выберите объекты</h5>
-                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">Авто-детекция, вручную или умное выделение — как удобнее.</p>
+                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">{t('intro.step2.title')}</h5>
+                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">{t('intro.step2.text')}</p>
                   </div>
                 </div>
                 <div className="flex items-start gap-3 bg-zinc-900/20 border border-zinc-900/50 rounded-2xl p-4">
                   <div className="w-7 h-7 rounded-full bg-zinc-900 text-violet-400 border border-zinc-800 font-bold text-xs flex items-center justify-center shrink-0 shadow-inner">3</div>
                   <div>
-                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">Скачайте результат</h5>
-                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">ИИ вырежет каждый объект отдельно — скачайте PNG или WebP.</p>
+                    <h5 className="font-bold text-zinc-200 text-xs sm:text-sm">{t('intro.step3.title')}</h5>
+                    <p className="text-[10.5px] text-zinc-400 leading-relaxed mt-1">{t('intro.step3.text')}</p>
                   </div>
                 </div>
               </div>
@@ -1689,7 +1732,7 @@ export default function App() {
       {/* Clean Mobile-friendly footer */}
       <footer className="w-full border-t border-zinc-900 bg-zinc-950 py-8 mt-auto text-center text-zinc-550 text-xs px-4">
         <p className="font-medium tracking-wide">
-          Asset Slicer — ИИ-вырезание объектов из любого изображения прямо с телефона.
+          {t('footer.tagline')}
         </p>
       </footer>
 
@@ -1704,8 +1747,8 @@ export default function App() {
                   <Settings className="w-5 h-5 text-white" />
                 </div>
                 <div>
-                  <h3 className="font-extrabold text-zinc-100 text-sm sm:text-base tracking-tight">Настройки ИИ и Экспорта</h3>
-                  <p className="text-[10px] text-zinc-450 font-semibold uppercase tracking-wider">Конфигурация для Android и Web</p>
+                  <h3 className="font-extrabold text-zinc-100 text-sm sm:text-base tracking-tight">{t('settings.title')}</h3>
+                  <p className="text-[10px] text-zinc-450 font-semibold uppercase tracking-wider">{t('settings.subtitle')}</p>
                 </div>
               </div>
               <button
@@ -1718,7 +1761,32 @@ export default function App() {
 
             {/* Modal Body */}
             <div className="p-6 flex-1 overflow-y-auto space-y-6">
-              
+
+              {/* Language switcher (top of settings) */}
+              <div className="flex items-center justify-between gap-3 bg-zinc-900/15 border border-zinc-850/60 rounded-2xl p-4 shadow-md backdrop-blur-md">
+                <div className="flex items-center gap-2">
+                  <Globe className="w-4 h-4 text-violet-400" />
+                  <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">{t('settings.language')}</label>
+                </div>
+                <div className="flex gap-1 bg-zinc-950/60 border border-zinc-800 rounded-xl p-1">
+                  {(['ru', 'en'] as const).map((l) => (
+                    <button
+                      key={l}
+                      type="button"
+                      onClick={() => setLang(l)}
+                      aria-pressed={lang === l}
+                      className={`py-1.5 px-3.5 text-[11px] font-bold rounded-lg uppercase transition-all cursor-pointer ${
+                        lang === l
+                          ? 'bg-violet-600 text-white shadow-sm'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      {l}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {Capacitor.isNativePlatform() ? (
                 <div className="bg-zinc-900/15 border border-zinc-850/60 rounded-2xl p-5 space-y-5 shadow-md relative overflow-hidden backdrop-blur-md">
                   <div className="absolute inset-0 bg-gradient-to-tr from-violet-600/4 via-indigo-600/1 to-transparent pointer-events-none" />
@@ -1726,14 +1794,14 @@ export default function App() {
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <Sparkles className="w-4 h-4 text-violet-400" />
-                      <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">Нативная модель ИИ (Android)</label>
+                      <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">{t('settings.nativeModel')}</label>
                     </div>
                   </div>
 
                   <div className="space-y-4">
                     <div className="flex justify-between items-center">
-                      <span className="text-[10px] font-extrabold text-zinc-400 uppercase tracking-wider block">Сохраненные локальные модели:</span>
-                      <span className="text-[9px] text-zinc-550 font-bold uppercase tracking-widest">Всего: {modelsList.length}</span>
+                      <span className="text-[10px] font-extrabold text-zinc-400 uppercase tracking-wider block">{t('settings.savedModels')}</span>
+                      <span className="text-[9px] text-zinc-550 font-bold uppercase tracking-widest">{t('settings.totalCount', { n: modelsList.length })}</span>
                     </div>
                     
                     <div className="grid grid-cols-1 gap-3 max-h-[225px] overflow-y-auto pr-1.5 scrollbar-thin">
@@ -1753,7 +1821,7 @@ export default function App() {
                             <div className="flex justify-between items-center">
                               <div className="flex items-center gap-2">
                                 <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-violet-400 animate-pulse' : 'bg-zinc-650'}`} />
-                                <span className="text-xs font-bold text-zinc-200 font-sans tracking-tight">{model.name}</span>
+                                <span className="text-xs font-bold text-zinc-200 font-sans tracking-tight">{modelDisplayName(model, t)}</span>
                               </div>
                               <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
                                 <span className="text-[10px] px-2 py-0.5 rounded bg-zinc-900/80 text-zinc-400 font-mono font-bold">{model.sizeLabel}</span>
@@ -1772,7 +1840,7 @@ export default function App() {
                                       }
                                     }}
                                     className="w-6.5 h-6.5 rounded-lg bg-red-950/20 hover:bg-red-900/40 text-red-400 hover:text-red-350 flex items-center justify-center transition-all duration-200 cursor-pointer active:scale-90 hover:scale-105 border border-red-900/30 hover:border-red-900/50 shadow-sm"
-                                    title="Удалить модель из списка"
+                                    title={t('settings.deleteModelTitle')}
                                   >
                                     <Trash2 className="w-3.5 h-3.5" />
                                   </button>
@@ -1780,24 +1848,24 @@ export default function App() {
                               </div>
                             </div>
                             <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                              {model.description}
+                              {modelDescription(model, t)}
                             </p>
                             
                             <div className="flex justify-between items-center mt-1 border-t border-zinc-850/40 pt-2 text-[10px] font-bold uppercase tracking-wide">
                               {isCached ? (
                                 <span className="text-emerald-400 flex items-center gap-1.5 font-semibold">
                                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                                  Готова к работе
+                                  {t('settings.modelReady')}
                                 </span>
                               ) : (
                                 <span className="text-amber-400 flex items-center gap-1.5 font-semibold">
                                   <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                                  Требуется загрузка
+                                  {t('settings.modelNeedsDownload')}
                                 </span>
                               )}
                               {isActive && (
                                 <span className="text-violet-400 font-extrabold text-[9px] bg-violet-500/10 border border-violet-500/20 px-1.5 py-0.5 rounded-full uppercase tracking-wide animate-pulse">
-                                  Активна
+                                  {t('settings.modelActive')}
                                 </span>
                               )}
                             </div>
@@ -1808,35 +1876,35 @@ export default function App() {
 
                     {/* Add Custom Model Form */}
                     <div className="bg-zinc-950/60 border border-zinc-850/70 rounded-2xl p-4.5 space-y-3.5 relative overflow-hidden backdrop-blur-md">
-                      <span className="text-[10px] text-zinc-400 font-extrabold uppercase tracking-wider block">Добавить свою ONNX модель в список:</span>
+                      <span className="text-[10px] text-zinc-400 font-extrabold uppercase tracking-wider block">{t('settings.addModelLabel')}</span>
                       <div className="space-y-2">
                         <input
                           type="text"
                           value={newModelName}
                           onChange={(e) => setNewModelName(e.target.value)}
-                          placeholder="Название (например, BiRefNet-General)"
+                          placeholder={t('settings.modelNamePlaceholder')}
                           className="w-full bg-zinc-950/60 border border-zinc-850 hover:border-zinc-750 focus:border-violet-500/80 focus:ring-[3px] focus:ring-violet-500/10 rounded-xl px-3.5 py-2 text-xs text-zinc-200 placeholder-zinc-650 transition-all duration-300 outline-none"
                         />
                         <input
                           type="text"
                           value={newModelUrl}
                           onChange={(e) => setNewModelUrl(e.target.value)}
-                          placeholder="Прямой URL-адрес к .onnx файлу"
+                          placeholder={t('settings.modelUrlPlaceholder')}
                           className="w-full bg-zinc-950/60 border border-zinc-850 hover:border-zinc-750 focus:border-violet-500/80 focus:ring-[3px] focus:ring-violet-500/10 rounded-xl px-3.5 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-650 transition-all duration-300 outline-none"
                         />
                         <button
                           onClick={async () => {
                             if (!newModelName.trim() || !newModelUrl.trim()) {
-                              alert('Пожалуйста, введите название и URL модели');
+                              alert(t('settings.addModelValidation'));
                               return;
                             }
                             if (!newModelUrl.startsWith('http://') && !newModelUrl.startsWith('https://')) {
-                              alert('URL модели должен начинаться с http:// или https://');
+                              alert(t('settings.addModelUrlInvalid'));
                               return;
                             }
                             const urlNormalized = newModelUrl.trim();
                             if (modelsList.some(m => m.url === urlNormalized)) {
-                              alert('Модель с таким URL уже добавлена в список');
+                              alert(t('settings.addModelDuplicate'));
                               return;
                             }
                             const newModel: SavedModel = {
@@ -1844,7 +1912,7 @@ export default function App() {
                               url: urlNormalized,
                               sizeLabel: 'ONNX',
                               isPreset: false,
-                              description: 'Пользовательская модель.'
+                              descriptionKey: 'models.custom.desc'
                             };
                             const updated = [...modelsList, newModel];
                             setModelsList(updated);
@@ -1859,7 +1927,7 @@ export default function App() {
                           }}
                           className="w-full py-2.5 bg-gradient-to-r from-violet-950/40 to-indigo-950/40 hover:from-violet-900/35 hover:to-indigo-900/35 border border-violet-850/50 hover:border-violet-600/40 text-[11px] font-bold text-violet-300 hover:text-violet-200 rounded-xl transition-all duration-300 cursor-pointer active:scale-[0.98] shadow-sm flex items-center justify-center gap-1.5"
                         >
-                          + Добавить в список
+                          {t('settings.addModelButton')}
                         </button>
                       </div>
                     </div>
@@ -1872,11 +1940,14 @@ export default function App() {
                             <span className="flex items-center gap-1.5 font-sans">
                               <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-400" />
                               {modelFetchInfo && modelFetchInfo.total > 0
-                                ? `Загрузка модели… ${formatMb(modelFetchInfo.loaded)} / ${formatMb(modelFetchInfo.total)} МБ`
-                                : 'Загрузка модели...'}
+                                ? t('progress.modelDownloadMb', {
+                                    loaded: formatMb(modelFetchInfo.loaded),
+                                    total: formatMb(modelFetchInfo.total),
+                                  })
+                                : t('settings.downloadingModel')}
                               {modelFetchInfo?.resumed && (
                                 <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-400 uppercase tracking-wide font-extrabold">
-                                  докачка
+                                  {t('settings.resumedBadge')}
                                 </span>
                               )}
                             </span>
@@ -1896,7 +1967,7 @@ export default function App() {
                             className="w-full py-3 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white border border-violet-500/20 rounded-xl text-xs font-bold transition-all duration-300 shadow-lg shadow-violet-950/30 hover:shadow-violet-900/45 active:scale-[0.97] flex items-center justify-center gap-2 cursor-pointer"
                           >
                             <FolderDown className="w-4 h-4" />
-                            Скачать выбранную модель
+                            {t('settings.downloadModelButton')}
                           </button>
                         )
                       )}
@@ -1911,7 +1982,7 @@ export default function App() {
                         }}
                         className="flex-1 py-2.5 px-3 bg-red-950/15 hover:bg-red-950/30 border border-red-900/30 hover:border-red-800/40 rounded-xl text-[10px] font-bold uppercase tracking-wider text-red-400 hover:text-red-350 transition-all duration-250 cursor-pointer active:scale-[0.97] shadow-sm"
                       >
-                        Очистить кэш
+                        {t('settings.clearCache')}
                       </button>
                       <button
                         onClick={async () => {
@@ -1924,7 +1995,7 @@ export default function App() {
                         }}
                         className="py-2.5 px-3 bg-zinc-900/40 hover:bg-zinc-800/50 border border-zinc-800 hover:border-zinc-700 rounded-xl text-[10px] font-bold uppercase tracking-wider text-zinc-450 hover:text-zinc-200 transition-all duration-250 cursor-pointer active:scale-[0.97] shadow-sm"
                       >
-                        Сбросить
+                        {t('settings.resetModels')}
                       </button>
                     </div>
                   </div>
@@ -1936,13 +2007,11 @@ export default function App() {
 
                   <div className="flex items-center gap-2">
                     <Sparkles className="w-4 h-4 text-violet-400" />
-                    <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">ИИ-обработка (только Android)</label>
+                    <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">{t('settings.webAiTitle')}</label>
                   </div>
 
                   <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                    ИИ-вырезание фона выполняется нативно на устройстве (onnxruntime) и доступно
-                    только в мобильном приложении Android. Соберите APK или скачайте его из релизов.
-                    В браузере работает вырез без ИИ — по цвету фона листа.
+                    {t('settings.webAiText')}
                   </p>
                 </div>
               )}
@@ -1953,14 +2022,14 @@ export default function App() {
                 
                 <div className="flex items-center gap-2">
                   <Smartphone className="w-4 h-4 text-indigo-400" />
-                  <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">Директория экспорта</label>
+                  <label className="text-[11px] tracking-widest font-extrabold text-zinc-300 uppercase">{t('settings.exportDir')}</label>
                 </div>
 
                 <div className="space-y-3">
                   {Capacitor.isNativePlatform() && (
                     <div className="flex items-center justify-between gap-3 bg-zinc-950/60 border border-zinc-850 rounded-xl px-4 py-2.5">
                       <span className="text-xs text-zinc-300 min-w-0 truncate">
-                        Папка сохранения:{' '}
+                        {t('settings.exportFolderLabel')}{' '}
                         <span className="font-bold text-zinc-100">
                           {safFolderName || `Documents/${exportFolder}`}
                         </span>
@@ -1968,10 +2037,10 @@ export default function App() {
                       <button
                         onClick={handlePickExportFolder}
                         className="shrink-0 flex items-center gap-1.5 py-2 px-3 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 rounded-xl text-[11px] font-bold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95"
-                        title="Выбрать папку сохранения ассетов (системный выбор папки)"
+                        title={t('settings.changeFolderTitle')}
                       >
                         <FolderOpen className="w-3.5 h-3.5" />
-                        Изменить
+                        {t('settings.changeFolder')}
                       </button>
                     </div>
                   )}
@@ -1986,7 +2055,7 @@ export default function App() {
                     className="w-full bg-zinc-950/60 border border-zinc-850 hover:border-zinc-750 focus:border-violet-500/80 focus:ring-[3px] focus:ring-violet-500/10 rounded-xl px-4 py-2.5 text-xs text-zinc-200 placeholder-zinc-650 transition-all duration-300 outline-none"
                   />
                   <p className="text-[11px] text-zinc-400 leading-relaxed font-normal">
-                    Если папка сохранения не выбрана (путь по умолчанию), ассеты (PNG и WebP) сохраняются в указанную подпапку Android-директории <code className="text-violet-450 font-mono text-[10px] bg-violet-950/20 px-1 py-0.5 rounded border border-violet-900/30">Documents</code>.
+                    {t('settings.exportHintBefore')}{' '}<code className="text-violet-450 font-mono text-[10px] bg-violet-950/20 px-1 py-0.5 rounded border border-violet-900/30">Documents</code>{t('settings.exportHintAfter')}
                   </p>
                 </div>
               </div>
@@ -1998,7 +2067,7 @@ export default function App() {
                 onClick={() => setIsSettingsOpen(false)}
                 className="py-2.5 px-6 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white border border-violet-500/20 font-bold text-xs rounded-xl shadow-lg shadow-violet-950/30 transition-all duration-200 active:scale-95 cursor-pointer"
               >
-                Готово
+                {t('common.done')}
               </button>
             </div>
           </div>
@@ -2014,23 +2083,21 @@ export default function App() {
                 <Trash2 className="w-4 h-4 text-red-400" />
               </div>
               <h3 className="font-extrabold text-zinc-100 text-sm tracking-tight">
-                Очистить кэш моделей?
+                {t('clearCache.title')}
               </h3>
             </div>
             <p className="text-xs text-zinc-400 leading-relaxed">
-              Будут удалены <span className="font-bold text-red-400">все</span> скачанные
-              модели ИИ. Перед следующей обработкой их придётся скачивать заново
-              (десятки–сотни МБ трафика).
+              {t('clearCache.body1Before')} <span className="font-bold text-red-400">{t('clearCache.body1All')}</span> {t('clearCache.body1After')}
             </p>
             <p className="text-xs text-zinc-400 leading-relaxed">
-              Для подтверждения введите{' '}
-              <span className="font-mono font-bold text-red-400">УДАЛИТЬ</span>:
+              {t('clearCache.body2Before')}{' '}
+              <span className="font-mono font-bold text-red-400">{t('clearCache.confirmWord')}</span>:
             </p>
             <input
               type="text"
               value={clearCacheInput}
               onChange={(e) => setClearCacheInput(e.target.value)}
-              placeholder="УДАЛИТЬ"
+              placeholder={t('clearCache.confirmWord')}
               spellCheck={false}
               autoFocus
               className="w-full bg-zinc-950/60 border border-zinc-800 hover:border-zinc-700 focus:border-red-500/60 focus:ring-[3px] focus:ring-red-500/10 rounded-xl px-3.5 py-2.5 text-sm font-mono text-zinc-200 placeholder-zinc-600 transition-all duration-300 outline-none"
@@ -2040,7 +2107,7 @@ export default function App() {
                 onClick={() => setIsClearCacheOpen(false)}
                 className="py-2.5 px-4 bg-zinc-900/60 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 rounded-xl text-xs font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer active:scale-95"
               >
-                Отмена
+                {t('common.cancel')}
               </button>
               <button
                 onClick={async () => {
@@ -2051,7 +2118,7 @@ export default function App() {
                 disabled={!clearCacheConfirmed}
                 className="py-2.5 px-4 bg-red-600 hover:bg-red-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white rounded-xl text-xs font-bold transition-all shadow-md cursor-pointer active:scale-95 disabled:cursor-not-allowed"
               >
-                Удалить всё
+                {t('clearCache.deleteAll')}
               </button>
             </div>
           </div>

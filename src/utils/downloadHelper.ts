@@ -5,6 +5,7 @@
 
 import { Capacitor } from '@capacitor/core';
 import { Filesystem, Directory } from '@capacitor/filesystem';
+import { tGlobal } from '../i18n';
 
 /**
  * Типизированная ошибка «SAF-папка сохранения не выбрана / доступ потерян».
@@ -14,7 +15,7 @@ import { Filesystem, Directory } from '@capacitor/filesystem';
 export class NoExportFolderError extends Error {
   readonly code = 'NO_FOLDER';
   constructor() {
-    super('Папка сохранения не выбрана');
+    super(tGlobal('download.noFolder'));
     this.name = 'NoExportFolderError';
   }
 }
@@ -66,7 +67,7 @@ export async function downloadBinaryFile(
         });
         if (res && res.saved) {
           if (!silent) {
-            alert(`Файл успешно сохранен: ${res.path || filename}`);
+            alert(tGlobal('download.savedTo', { path: res.path || filename }));
           }
           console.log('Saved binary file via SAF:', res.path);
           return;
@@ -81,7 +82,7 @@ export async function downloadBinaryFile(
         if (!unimplemented) {
           // Реальная ошибка записи в выбранную папку — показываем/пробрасываем
           if (silent) throw e;
-          alert('Ошибка при сохранении файла: ' + msg);
+          alert(tGlobal('download.saveError', { error: msg }));
           return;
         }
         // Старый нативный слой без SAF-методов — проваливаемся в легаси-путь
@@ -111,7 +112,7 @@ export async function downloadBinaryFile(
         recursive: true
       });
       if (!silent) {
-        alert(`Файл успешно сохранен в Documents/${exportFolder}/${filename}`);
+        alert(tGlobal('download.savedToDocuments', { folder: exportFolder, file: filename }));
       }
       console.log('Saved binary file successfully:', result.uri);
     } catch (e) {
@@ -126,13 +127,13 @@ export async function downloadBinaryFile(
           recursive: true
         });
         if (!silent) {
-          alert(`Файл сохранен в корне Documents: ${filename}`);
+          alert(tGlobal('download.savedToRoot', { file: filename }));
         }
       } catch (err2) {
         if (silent) {
           throw err2;
         }
-        alert('Ошибка при сохранении файла: ' + String(err2));
+        alert(tGlobal('download.saveError', { error: String(err2) }));
       }
     }
   } else {

@@ -21,6 +21,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { Rect, SelectionItem, SelectionMask } from '../types';
+import { useT } from '../i18n';
 import {
   buildForegroundMask,
   refineForegroundMask,
@@ -155,6 +156,7 @@ export default function ObjectSelector({
   onProcessObjects,
   onProcessWholeSheet,
 }: ObjectSelectorProps) {
+  const { t } = useT();
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [boxes, setBoxes] = useState<SelectionBox[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -715,20 +717,20 @@ export default function ObjectSelector({
     label: string;
     icon: React.ReactNode;
   }> = [
-    { key: 'auto', label: 'Авто', icon: <Wand2 className="w-3.5 h-3.5" /> },
-    { key: 'manual', label: 'Вручную', icon: <MousePointer2 className="w-3.5 h-3.5" /> },
-    { key: 'snap', label: 'Прилипание', icon: <Magnet className="w-3.5 h-3.5" /> },
-    { key: 'smart', label: 'Умное', icon: <Wand className="w-3.5 h-3.5" /> },
+    { key: 'auto', label: t('selector.mode.auto'), icon: <Wand2 className="w-3.5 h-3.5" /> },
+    { key: 'manual', label: t('selector.mode.manual'), icon: <MousePointer2 className="w-3.5 h-3.5" /> },
+    { key: 'snap', label: t('selector.mode.snap'), icon: <Magnet className="w-3.5 h-3.5" /> },
+    { key: 'smart', label: t('selector.mode.smart'), icon: <Wand className="w-3.5 h-3.5" /> },
   ];
 
   const modeHint =
     mode === 'auto'
-      ? 'Объекты найдены автоматически. Удалите лишние рамки крестиком или добавьте свои перетаскиванием.'
+      ? t('selector.hint.auto')
       : mode === 'manual'
-        ? 'Нарисуйте рамку перетаскиванием. Перемещайте её за тело, меняйте размер за углы.'
+        ? t('selector.hint.manual')
         : mode === 'snap'
-          ? 'Нарисуйте грубую рамку вокруг объекта — она автоматически прилипнет к его границам.'
-          : 'Коснитесь объекта — он выделится точно по контуру. Повторное касание снимает выделение, касание фона ничего не делает.';
+          ? t('selector.hint.snap')
+          : t('selector.hint.smart');
 
   return (
     <div className="w-full flex flex-col gap-5 mt-2 max-w-7xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -741,17 +743,16 @@ export default function ObjectSelector({
               <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-violet-600 to-indigo-600 flex items-center justify-center shadow-md">
                 <Sparkles className="w-4 h-4 text-white" />
               </div>
-              Выбор объектов для ИИ-вырезания
+              {t('selector.title')}
             </h3>
             <p className="text-xs text-zinc-400 mt-1.5 leading-relaxed max-w-xl">
-              Каждый отмеченный объект будет вырезан нейросетью отдельным кропом —
-              это заметно повышает качество краёв.
+              {t('selector.subtitle')}
             </p>
           </div>
           <button
             onClick={onCancel}
             className="shrink-0 bg-zinc-950/80 hover:bg-zinc-950 hover:text-white backdrop-blur-md border border-zinc-800 text-zinc-400 p-2 rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
-            title="Отмена — загрузить другое изображение"
+            title={t('selector.cancelTitle')}
           >
             <X className="w-4 h-4" />
           </button>
@@ -787,7 +788,7 @@ export default function ObjectSelector({
               ) : (
                 <RefreshCw className="w-3.5 h-3.5 text-violet-400" />
               )}
-              Найти объекты снова
+              {t('selector.redetect')}
             </button>
           )}
 
@@ -800,12 +801,12 @@ export default function ObjectSelector({
               className="flex items-center gap-1.5 py-2 px-3.5 bg-red-950/15 hover:bg-red-950/30 border border-red-900/30 hover:border-red-800/40 rounded-xl text-xs font-semibold text-red-400 transition-all cursor-pointer active:scale-95"
             >
               <Trash2 className="w-3.5 h-3.5" />
-              Очистить всё
+              {t('selector.clearAll')}
             </button>
           )}
 
           <div className="ml-auto flex items-center gap-2 bg-zinc-950/60 border border-zinc-800/60 rounded-full px-4 py-1.5 text-xs shadow-inner">
-            <span className="text-zinc-400 font-medium">Рамок:</span>
+            <span className="text-zinc-400 font-medium">{t('selector.boxCount')}</span>
             <span className="text-emerald-400 font-bold font-mono">{boxes.length}</span>
           </div>
         </div>
@@ -815,10 +816,10 @@ export default function ObjectSelector({
         {/* Подрежим «Умного» выделения: контур или рамка */}
         {mode === 'smart' && (
           <div className="flex items-center gap-2 -mt-1">
-            <span className="text-[11px] text-zinc-500 font-medium">Выделять:</span>
+            <span className="text-[11px] text-zinc-500 font-medium">{t('selector.smartVariantLabel')}</span>
             {([
-              { key: 'contour', label: 'По контуру' },
-              { key: 'rect', label: 'Рамкой' },
+              { key: 'contour', label: t('selector.smartVariant.contour') },
+              { key: 'rect', label: t('selector.smartVariant.rect') },
             ] as const).map(v => (
               <button
                 key={v.key}
@@ -841,7 +842,7 @@ export default function ObjectSelector({
           {!image ? (
             <div className="flex flex-col items-center gap-3 text-zinc-400 py-16">
               <Loader2 className="w-8 h-8 animate-spin text-violet-400" />
-              <span className="text-xs font-semibold">Загрузка изображения...</span>
+              <span className="text-xs font-semibold">{t('selector.loadingImage')}</span>
             </div>
           ) : (
             <div
@@ -850,7 +851,7 @@ export default function ObjectSelector({
             >
               <img
                 src={imageSrc}
-                alt="Лист с объектами"
+                alt={t('selector.sheetAlt')}
                 draggable={false}
                 className="block max-w-full max-h-[480px] w-auto h-auto border border-zinc-800 shadow-2xl select-none pointer-events-none"
               />
@@ -908,7 +909,7 @@ export default function ObjectSelector({
                           deleteBox(box.id);
                         }}
                         className="absolute -top-2.5 -right-2.5 w-5 h-5 rounded-full bg-red-500 hover:bg-red-400 text-white flex items-center justify-center shadow-md transition-all active:scale-90 cursor-pointer pointer-events-auto"
-                        title="Удалить рамку"
+                        title={t('selector.deleteBoxTitle')}
                       >
                         <X className="w-3 h-3" />
                       </button>
@@ -944,7 +945,7 @@ export default function ObjectSelector({
               {isDetecting && (
                 <div className="absolute top-3 left-3 z-30 bg-zinc-950/80 backdrop-blur-md border border-zinc-800 px-3 py-1.5 rounded-full flex items-center gap-2 text-xs font-semibold text-zinc-300 pointer-events-none">
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-400" />
-                  Поиск объектов...
+                  {t('selector.detecting')}
                 </div>
               )}
             </div>
@@ -955,10 +956,10 @@ export default function ObjectSelector({
         <div className="flex items-center justify-between gap-3 bg-zinc-950/40 border border-zinc-800/70 rounded-2xl px-4 py-3">
           <div className="flex flex-col gap-0.5 pr-2">
             <span className="text-xs font-bold text-zinc-200">
-              Исключать вложенные рамки
+              {t('selector.excludeNested')}
             </span>
             <p className="text-[10.5px] text-zinc-400 leading-relaxed">
-              Объекты, попавшие внутрь другой рамки, будут вырезаны из её результата по контуру.
+              {t('selector.excludeNestedDesc')}
             </p>
           </div>
           <button
@@ -970,7 +971,7 @@ export default function ObjectSelector({
                 ? 'bg-violet-600 shadow-[0_0_10px_rgba(124,58,237,0.3)] justify-end'
                 : 'bg-zinc-800 justify-start'
             }`}
-            title="Исключать вложенные рамки из результата родительской"
+            title={t('selector.excludeNestedTitle')}
           >
             <span className="w-4.5 h-4.5 rounded-full bg-white shadow-md transition-all duration-300" />
           </button>
@@ -989,7 +990,7 @@ export default function ObjectSelector({
             className="flex-1 flex items-center justify-center gap-2 py-3.5 px-6 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:from-zinc-800 disabled:to-zinc-800 disabled:text-zinc-500 text-white rounded-2xl font-bold text-sm transition-all duration-300 shadow-[0_4px_12px_rgba(124,58,237,0.25)] hover:shadow-[0_4px_20px_rgba(124,58,237,0.4)] active:scale-[0.98] cursor-pointer disabled:cursor-not-allowed"
           >
             <Sparkles className="w-4 h-4" />
-            Обработать ({boxes.length})
+            {t('selector.process', { n: boxes.length })}
           </button>
           <button
             onClick={onProcessWholeSheet}
@@ -997,7 +998,7 @@ export default function ObjectSelector({
             className="flex items-center justify-center gap-2 py-3.5 px-6 bg-zinc-900/60 hover:bg-zinc-800/80 border border-zinc-800 hover:border-zinc-700 text-zinc-300 hover:text-white rounded-2xl font-bold text-sm transition-all duration-300 shadow-md active:scale-[0.98] cursor-pointer disabled:opacity-50"
           >
             <Layers className="w-4 h-4" />
-            Весь лист (без нарезки)
+            {t('selector.wholeSheet')}
           </button>
         </div>
       </div>

@@ -5,12 +5,15 @@
 
 import React, { useRef, useState } from 'react';
 import { Upload, Camera, Sparkles, Image as ImageIcon } from 'lucide-react';
+import { useT, I18nKey } from '../i18n';
 
 /** Минимум данных о модели для списка на главной (структурно совместим с SavedModel из App). */
 interface UploaderModel {
   name: string;
   url: string;
   sizeLabel: string;
+  /** Локализуемый квалификатор в скобках после имени (как в SavedModel). */
+  nameSuffixKey?: string;
 }
 
 interface ImageUploaderProps {
@@ -43,6 +46,7 @@ export default function ImageUploader({
   onOpenSettings,
   showModelList
 }: ImageUploaderProps) {
+  const { t } = useT();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -237,10 +241,10 @@ export default function ImageUploader({
           <Upload className="w-6 h-6 text-zinc-400 group-hover:text-violet-400 transition-colors duration-300" />
         </div>
         <h3 className="font-bold text-zinc-100 text-lg sm:text-xl mb-2 tracking-tight group-hover:text-white transition-colors duration-300">
-          Загрузите лист с ассетами
+          {t('uploader.title')}
         </h3>
         <p className="text-zinc-400 text-sm max-w-xs mb-5 leading-relaxed">
-          Перетащите файл сюда или нажмите для выбора из галереи
+          {t('uploader.dropHint')}
         </p>
         <span className="text-xs text-zinc-400 bg-zinc-950/80 border border-zinc-800 rounded-full px-4.5 py-1.5 font-mono tracking-wide shadow-inner">
           PNG, JPG, WebP
@@ -255,7 +259,7 @@ export default function ImageUploader({
           className="flex items-center justify-center gap-2.5 py-3.5 px-4 bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 text-zinc-300 hover:text-zinc-100 rounded-2xl font-semibold text-sm transition-all duration-300 shadow-md hover:shadow-lg active:scale-98 cursor-pointer"
         >
           <ImageIcon className="w-4 h-4 text-zinc-400" />
-          Выбрать файл
+          {t('uploader.chooseFile')}
         </button>
 
         <button
@@ -264,7 +268,7 @@ export default function ImageUploader({
           className="flex items-center justify-center gap-2.5 py-3.5 px-4 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white rounded-2xl font-semibold text-sm transition-all duration-300 shadow-[0_4px_12px_rgba(124,58,237,0.2)] hover:shadow-[0_4px_20px_rgba(124,58,237,0.35)] active:scale-98 cursor-pointer"
         >
           <Camera className="w-4 h-4" />
-          Сделать фото
+          {t('uploader.takePhoto')}
         </button>
       </div>
 
@@ -274,10 +278,10 @@ export default function ImageUploader({
         <div className="flex flex-col gap-1 pr-3 relative z-10">
           <span className="text-sm font-bold text-zinc-200 flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-violet-400 shrink-0" />
-            Авто-удаление фона через AI
+            {t('uploader.aiToggle')}
           </span>
           <p className="text-xs text-zinc-400 leading-relaxed max-w-sm">
-            Автоматически вырежет фон нейросетью прямо при загрузке.
+            {t('uploader.aiToggleDesc')}
           </p>
         </div>
         <button
@@ -297,13 +301,13 @@ export default function ImageUploader({
       {useAIBgRemoval && showModelList && (
         <div className="w-full mt-4 bg-zinc-900/40 border border-zinc-800/80 rounded-2xl p-4.5 flex flex-col gap-3 shadow-md backdrop-blur-md animate-in fade-in duration-300">
           <div className="flex justify-between items-center text-xs">
-            <span className="font-bold text-zinc-300 uppercase tracking-wider">Модель ИИ</span>
+            <span className="font-bold text-zinc-300 uppercase tracking-wider">{t('uploader.aiModel')}</span>
             <button
               type="button"
               onClick={onOpenSettings}
               className="text-violet-400 hover:text-violet-300 font-bold flex items-center gap-1 transition-all cursor-pointer hover:underline"
             >
-              Все настройки
+              {t('uploader.allSettings')}
             </button>
           </div>
           <div className="flex flex-col gap-2">
@@ -322,7 +326,9 @@ export default function ImageUploader({
                   }`}
                 >
                   <span className="text-xs font-semibold text-zinc-200 truncate min-w-0">
-                    {model.name}
+                    {model.nameSuffixKey
+                      ? `${model.name} (${t(model.nameSuffixKey as I18nKey)})`
+                      : model.name}
                   </span>
                   <span className="flex items-center gap-1.5 shrink-0">
                     <span className="text-[10px] px-2 py-0.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-400 font-mono font-bold">
@@ -330,11 +336,11 @@ export default function ImageUploader({
                     </span>
                     {isCached ? (
                       <span className="text-[10px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded-full whitespace-nowrap">
-                        ✓ скачана
+                        {t('uploader.cached')}
                       </span>
                     ) : (
                       <span className="text-[10px] font-semibold text-zinc-400 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded-full whitespace-nowrap">
-                        не скачана
+                        {t('uploader.notCached')}
                       </span>
                     )}
                   </span>
@@ -349,7 +355,7 @@ export default function ImageUploader({
       <div className="w-full mt-10 border-t border-zinc-800/85 pt-8">
         <div className="flex items-center gap-2 justify-center mb-4 text-xs font-bold uppercase tracking-wider text-zinc-500">
           <Sparkles className="w-3.5 h-3.5 text-zinc-500" />
-          Быстрый тест без загрузки своих файлов
+          {t('uploader.demoLabel')}
         </div>
         <div className="flex flex-col sm:flex-row gap-3 justify-center w-full">
           <button
@@ -362,7 +368,7 @@ export default function ImageUploader({
               <span className="w-2.5 h-2.5 rounded-full bg-sky-500 block shadow-[0_0_6px_rgba(14,165,233,0.4)]"></span>
               <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 block shadow-[0_0_6px_rgba(16,185,129,0.4)]"></span>
             </div>
-            Лист иконок (Белый фон)
+            {t('uploader.demoIcons')}
           </button>
           <button
             id="demo-sheet-2"
@@ -374,7 +380,7 @@ export default function ImageUploader({
               <span className="w-2.5 h-2.5 rounded bg-violet-500 block shadow-[0_0_6px_rgba(139,92,246,0.4)]"></span>
               <span className="w-2.5 h-2.5 rounded bg-pink-500 block shadow-[0_0_6px_rgba(236,72,153,0.4)]"></span>
             </div>
-            Лист логотипов (Светлый фон)
+            {t('uploader.demoLogos')}
           </button>
         </div>
       </div>

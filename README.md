@@ -13,6 +13,12 @@ as a separate transparent-background image. No servers, no uploads.
 Built with React + TypeScript + Vite and Capacitor (Android). Inference runs natively
 via ONNX Runtime.
 
+## Screenshots
+
+| Model picker | Object selection | Asset gallery |
+|---|---|---|
+| ![Main screen](docs/screenshots/main.jpg) | ![Object selection](docs/screenshots/selector.jpg) | ![Gallery](docs/screenshots/gallery.jpg) |
+
 ## Features
 
 - **Object selection on the sheet** — automatic detection, manual boxes, edge
@@ -77,8 +83,6 @@ src/
 android/
   .../BackgroundRemovalPlugin.kt  # ONNX Runtime inference (CPU EP), resumable
                                   # model download, raw-mask mode
-tools/
-  pipeline.py             # Python reference of the native processing pipeline
 ```
 
 ## Security note
