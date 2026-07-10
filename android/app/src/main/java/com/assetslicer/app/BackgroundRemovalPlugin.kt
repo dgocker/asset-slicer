@@ -58,6 +58,28 @@ class BackgroundRemovalPlugin : Plugin() {
         // Lock to prevent concurrent session access and disposal crashes
         private val sessionLock = ReentrantLock()
 
+        // --- MobileSAM: ОТДЕЛЬНОЕ состояние (не пересекается с ortSession выше) ---
+        @Volatile
+        private var samEncoderSession: OrtSession? = null
+        @Volatile
+        private var samEncoderPath: String? = null
+        @Volatile
+        private var samDecoderSession: OrtSession? = null
+        @Volatile
+        private var samDecoderPath: String? = null
+        /** Embedding текущего листа [1,256,64,64]; живёт от samPrepare до samRelease. */
+        @Volatile
+        private var samEmbedding: OnnxTensor? = null
+        @Volatile
+        private var samOrigW = 0
+        @Volatile
+        private var samOrigH = 0
+        /** Масштаб 1024-кадра декодера: coord1024 = coordOrig * samScale. */
+        @Volatile
+        private var samScale = 1f
+        // Отдельный лок: SAM-вызовы не должны конкурировать с вырезанием фона
+        private val samLock = ReentrantLock()
+
         private fun getSession(env: OrtEnvironment, modelPath: String, preferCpu: Boolean = false): OrtSession {
             sessionLock.withLock {
                 var session = ortSession
@@ -366,6 +388,23 @@ class BackgroundRemovalPlugin : Plugin() {
         }
     }
 
+    /** Декодирует вход image (dataURL / чистый base64 / content://, file://, путь) в Bitmap. */
+    private fun decodeImageInput(imageStr: String): Bitmap? {
+        return if (imageStr.startsWith("data:image")) {
+            val base64Str = imageStr.substringAfter(",")
+            val decodedBytes = Base64.decode(base64Str, Base64.DEFAULT)
+            BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
+        } else if (imageStr.startsWith("content://") || imageStr.startsWith("file://") || imageStr.startsWith("/")) {
+            val uri = Uri.parse(imageStr)
+            context.contentResolver.openInputStream(uri).use { inputStream ->
+                BitmapFactory.decodeStream(inputStream)
+            }
+        } else {
+            val decodedBytes = Base64.decode(imageStr, Base64.DEFAULT)
+            BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
+        }
+    }
+
     private fun computeSha256(file: File): String {
         val md = java.security.MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
@@ -416,19 +455,7 @@ class BackgroundRemovalPlugin : Plugin() {
             var results: OrtSession.Result? = null
 
             try {
-                originalBitmap = if (imageStr.startsWith("data:image")) {
-                    val base64Str = imageStr.substringAfter(",")
-                    val decodedBytes = Base64.decode(base64Str, Base64.DEFAULT)
-                    BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
-                } else if (imageStr.startsWith("content://") || imageStr.startsWith("file://") || imageStr.startsWith("/")) {
-                    val uri = Uri.parse(imageStr)
-                    context.contentResolver.openInputStream(uri).use { inputStream ->
-                        BitmapFactory.decodeStream(inputStream)
-                    }
-                } else {
-                    val decodedBytes = Base64.decode(imageStr, Base64.DEFAULT)
-                    BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
-                }
+                originalBitmap = decodeImageInput(imageStr)
 
                 if (originalBitmap == null) {
                     call.reject("Decoded image is null")
@@ -752,6 +779,290 @@ class BackgroundRemovalPlugin : Plugin() {
         }
     }
 
+    // ---------- MobileSAM: движок выделения по промпту (точки / рамка) ----------
+
+    /** CPU-опции ORT-сессии для SAM: как в CPU-пути вырезания (арена выключена). */
+    private fun samSessionOptions(): OrtSession.SessionOptions {
+        val opts = OrtSession.SessionOptions()
+        val numCores = Runtime.getRuntime().availableProcessors()
+        opts.setIntraOpNumThreads(maxOf(1, numCores - 1))
+        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        opts.setCPUArenaAllocator(false)
+        opts.setMemoryPatternOptimization(false)
+        return opts
+    }
+
+    /**
+     * Готовит SAM для листа: создаёт/кэширует сессии энкодера и декодера,
+     * прогоняет энкодер по изображению и сохраняет embedding [1,256,64,64].
+     * Контракт энкодера: вход `input_image` float32 [H,W,3] RGB, СЫРЫЕ пиксели
+     * 0..255 (нормализация и zero-паддинг до 1024×1024 зашиты в граф); снаружи
+     * только bilinear-resize с сохранением аспекта (длинная сторона = 1024).
+     * Обе модели должны быть заранее скачаны через preloadModel.
+     */
+    @PluginMethod
+    fun samPrepare(call: PluginCall) {
+        val encoderUrl = call.getString("encoderUrl")
+        val decoderUrl = call.getString("decoderUrl")
+        val imageStr = call.getString("image")
+        if (encoderUrl.isNullOrEmpty() || decoderUrl.isNullOrEmpty() || imageStr.isNullOrEmpty()) {
+            call.reject("encoderUrl, decoderUrl and image parameters are required")
+            return
+        }
+        val encoderFile = getModelFile(encoderUrl)
+        val decoderFile = getModelFile(decoderUrl)
+        if (!encoderFile.exists() || encoderFile.length() == 0L ||
+            !decoderFile.exists() || decoderFile.length() == 0L
+        ) {
+            call.reject("SAM model not preloaded. Call preloadModel for encoder and decoder first.")
+            return
+        }
+
+        executorService.execute {
+            var originalBitmap: Bitmap? = null
+            var resizedBitmap: Bitmap? = null
+            var inputTensor: OnnxTensor? = null
+            var results: OrtSession.Result? = null
+            samLock.withLock {
+                try {
+                    val env = OrtEnvironment.getEnvironment()
+
+                    var encoder = samEncoderSession
+                    if (encoder == null || samEncoderPath != encoderFile.absolutePath) {
+                        try { samEncoderSession?.close() } catch (e: Exception) {}
+                        samSessionOptions().use { opts ->
+                            encoder = env.createSession(encoderFile.absolutePath, opts)
+                        }
+                        samEncoderSession = encoder
+                        samEncoderPath = encoderFile.absolutePath
+                    }
+                    if (samDecoderSession == null || samDecoderPath != decoderFile.absolutePath) {
+                        try { samDecoderSession?.close() } catch (e: Exception) {}
+                        samSessionOptions().use { opts ->
+                            samDecoderSession = env.createSession(decoderFile.absolutePath, opts)
+                        }
+                        samDecoderPath = decoderFile.absolutePath
+                    }
+
+                    originalBitmap = decodeImageInput(imageStr)
+                    val bitmap = originalBitmap
+                    if (bitmap == null) {
+                        call.reject("Decoded image is null")
+                        return@execute
+                    }
+                    val origW = bitmap.width
+                    val origH = bitmap.height
+
+                    // Resize с сохранением аспекта: длинная сторона = 1024
+                    val scale = 1024f / maxOf(origW, origH)
+                    val newW = Math.round(origW * scale).coerceIn(1, 1024)
+                    val newH = Math.round(origH * scale).coerceIn(1, 1024)
+                    resizedBitmap = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+
+                    val pixels = IntArray(newW * newH)
+                    resizedBitmap!!.getPixels(pixels, 0, newW, 0, 0, newW, newH)
+                    // HWC RGB, сырые значения 0..255 (без нормализации — она в графе)
+                    val inputData = FloatArray(newW * newH * 3)
+                    for (i in 0 until newW * newH) {
+                        val p = pixels[i]
+                        inputData[3 * i] = ((p shr 16) and 0xFF).toFloat()
+                        inputData[3 * i + 1] = ((p shr 8) and 0xFF).toFloat()
+                        inputData[3 * i + 2] = (p and 0xFF).toFloat()
+                    }
+                    inputTensor = OnnxTensor.createTensor(
+                        env,
+                        java.nio.FloatBuffer.wrap(inputData),
+                        longArrayOf(newH.toLong(), newW.toLong(), 3L)
+                    )
+
+                    val session = encoder!!
+                    val inputName = session.inputNames.first()
+                    results = session.run(mapOf(inputName to inputTensor))
+                    val embOut = results!!.get(0) as OnnxTensor
+                    // Тензоры Result закрываются вместе с ним — embedding живёт
+                    // между вызовами, поэтому данные копируются в собственный тензор
+                    val embCopy = OnnxTensor.createTensor(env, embOut.floatBuffer, embOut.info.shape.clone())
+                    try { samEmbedding?.close() } catch (e: Exception) {}
+                    samEmbedding = embCopy
+                    samOrigW = origW
+                    samOrigH = origH
+                    samScale = scale
+
+                    val res = JSObject()
+                    res.put("width", origW)
+                    res.put("height", origH)
+                    call.resolve(res)
+                } catch (t: Throwable) { // включая OutOfMemoryError
+                    call.reject("SAM prepare failed: ${t.localizedMessage}", Exception(t))
+                } finally {
+                    if (resizedBitmap != originalBitmap) resizedBitmap?.recycle()
+                    originalBitmap?.recycle()
+                    try { inputTensor?.close() } catch (e: Exception) {}
+                    try { results?.close() } catch (e: Exception) {}
+                }
+            }
+        }
+    }
+
+    /**
+     * Прогон декодера SAM по промпту (точки и/или рамка в пикселях ОРИГИНАЛА).
+     * Контракт: point_coords в системе 1024-кадра (coord * samScale); метки:
+     * 1 = точка объекта, 2/3 = углы рамки, -1 = padding (обязателен для промпта
+     * из одних точек); orig_im_size = (H, W); выход masks [1,1,H,W] — логиты,
+     * бинаризация mask > 0. Ответ: PNG-маска (белый = объект) в base64.
+     */
+    @PluginMethod
+    fun samPrompt(call: PluginCall) {
+        val pointsArr = call.getArray("points")
+        val boxObj = call.getObject("box")
+        if ((pointsArr == null || pointsArr.length() == 0) && boxObj == null) {
+            call.reject("points or box parameter is required")
+            return
+        }
+
+        executorService.execute {
+            var coordsTensor: OnnxTensor? = null
+            var labelsTensor: OnnxTensor? = null
+            var maskInputTensor: OnnxTensor? = null
+            var hasMaskTensor: OnnxTensor? = null
+            var origSizeTensor: OnnxTensor? = null
+            var results: OrtSession.Result? = null
+            var maskBitmap: Bitmap? = null
+            samLock.withLock {
+                try {
+                    val emb = samEmbedding
+                    val decoder = samDecoderSession
+                    if (emb == null || decoder == null) {
+                        call.reject("SAM not prepared. Call samPrepare first.")
+                        return@execute
+                    }
+                    val env = OrtEnvironment.getEnvironment()
+
+                    val coords = ArrayList<Float>()
+                    val labels = ArrayList<Float>()
+                    if (pointsArr != null) {
+                        for (i in 0 until pointsArr.length()) {
+                            val o = pointsArr.getJSONObject(i)
+                            coords.add(o.getDouble("x").toFloat() * samScale)
+                            coords.add(o.getDouble("y").toFloat() * samScale)
+                            labels.add((if (o.has("label")) o.getInt("label") else 1).toFloat())
+                        }
+                    }
+                    if (boxObj != null) {
+                        coords.add(boxObj.getDouble("x0").toFloat() * samScale)
+                        coords.add(boxObj.getDouble("y0").toFloat() * samScale)
+                        labels.add(2f)
+                        coords.add(boxObj.getDouble("x1").toFloat() * samScale)
+                        coords.add(boxObj.getDouble("y1").toFloat() * samScale)
+                        labels.add(3f)
+                    } else {
+                        // Промпт из одних точек: обязательная padding-точка
+                        coords.add(0f)
+                        coords.add(0f)
+                        labels.add(-1f)
+                    }
+                    val n = labels.size.toLong()
+                    coordsTensor = OnnxTensor.createTensor(
+                        env, java.nio.FloatBuffer.wrap(coords.toFloatArray()), longArrayOf(1, n, 2)
+                    )
+                    labelsTensor = OnnxTensor.createTensor(
+                        env, java.nio.FloatBuffer.wrap(labels.toFloatArray()), longArrayOf(1, n)
+                    )
+                    maskInputTensor = OnnxTensor.createTensor(
+                        env, java.nio.FloatBuffer.wrap(FloatArray(256 * 256)), longArrayOf(1, 1, 256, 256)
+                    )
+                    hasMaskTensor = OnnxTensor.createTensor(
+                        env, java.nio.FloatBuffer.wrap(floatArrayOf(0f)), longArrayOf(1)
+                    )
+                    origSizeTensor = OnnxTensor.createTensor(
+                        env,
+                        java.nio.FloatBuffer.wrap(floatArrayOf(samOrigH.toFloat(), samOrigW.toFloat())),
+                        longArrayOf(2)
+                    )
+
+                    results = decoder.run(
+                        mapOf(
+                            "image_embeddings" to emb,
+                            "point_coords" to coordsTensor!!,
+                            "point_labels" to labelsTensor!!,
+                            "mask_input" to maskInputTensor!!,
+                            "has_mask_input" to hasMaskTensor!!,
+                            "orig_im_size" to origSizeTensor!!
+                        )
+                    )
+
+                    val masksVal = results!!.get("masks")
+                    val masksTensor =
+                        (if (masksVal.isPresent) masksVal.get() else results!!.get(0)) as OnnxTensor
+                    val mShape = masksTensor.info.shape
+                    val mh = mShape[mShape.size - 2].toInt()
+                    val mw = mShape[mShape.size - 1].toInt()
+
+                    var iou = 0f
+                    try {
+                        val iouVal = results!!.get("iou_predictions")
+                        if (iouVal.isPresent) {
+                            val buf = (iouVal.get() as OnnxTensor).floatBuffer
+                            if (buf.remaining() > 0) iou = buf.get(0)
+                        }
+                    } catch (e: Exception) {
+                        // iou опционален — маска важнее
+                    }
+
+                    // Построчно (логиты origH×origW могут быть десятки МБ):
+                    // бинаризация >0 → белый непрозрачный пиксель, иначе прозрачный.
+                    // ALPHA_8 в PNG прозрачность не сохраняет корректно — ARGB.
+                    val fb = masksTensor.floatBuffer
+                    maskBitmap = Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888)
+                    val rowF = FloatArray(mw)
+                    val rowPx = IntArray(mw)
+                    for (y in 0 until mh) {
+                        fb.get(rowF)
+                        for (x in 0 until mw) {
+                            rowPx[x] = if (rowF[x] > 0f) 0xFFFFFFFF.toInt() else 0
+                        }
+                        maskBitmap!!.setPixels(rowPx, 0, mw, 0, y, mw, 1)
+                    }
+
+                    val baos = java.io.ByteArrayOutputStream()
+                    maskBitmap!!.compress(Bitmap.CompressFormat.PNG, 100, baos)
+                    val maskBase64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+
+                    val res = JSObject()
+                    res.put("maskBase64", maskBase64)
+                    res.put("width", mw)
+                    res.put("height", mh)
+                    res.put("iou", iou)
+                    call.resolve(res)
+                } catch (t: Throwable) { // включая OutOfMemoryError
+                    call.reject("SAM prompt failed: ${t.localizedMessage}", Exception(t))
+                } finally {
+                    maskBitmap?.recycle()
+                    try { coordsTensor?.close() } catch (e: Exception) {}
+                    try { labelsTensor?.close() } catch (e: Exception) {}
+                    try { maskInputTensor?.close() } catch (e: Exception) {}
+                    try { hasMaskTensor?.close() } catch (e: Exception) {}
+                    try { origSizeTensor?.close() } catch (e: Exception) {}
+                    try { results?.close() } catch (e: Exception) {}
+                }
+            }
+        }
+    }
+
+    /** Освобождает embedding листа (сессии SAM остаются — их прогрев дорогой). */
+    @PluginMethod
+    fun samRelease(call: PluginCall) {
+        executorService.execute {
+            samLock.withLock {
+                try { samEmbedding?.close() } catch (e: Exception) {}
+                samEmbedding = null
+                samOrigW = 0
+                samOrigH = 0
+                call.resolve()
+            }
+        }
+    }
+
     @PluginMethod
     fun isModelCached(call: PluginCall) {
         val modelUrl = call.getString("url")
@@ -931,6 +1242,22 @@ class BackgroundRemovalPlugin : Plugin() {
     override fun handleOnDestroy() {
         super.handleOnDestroy()
         executorService.execute {
+            samLock.withLock {
+                try {
+                    samEmbedding?.close()
+                    samEmbedding = null
+                } catch (e: Exception) {}
+                try {
+                    samEncoderSession?.close()
+                    samEncoderSession = null
+                    samEncoderPath = null
+                } catch (e: Exception) {}
+                try {
+                    samDecoderSession?.close()
+                    samDecoderSession = null
+                    samDecoderPath = null
+                } catch (e: Exception) {}
+            }
             sessionLock.withLock {
                 try {
                     ortSession?.close()

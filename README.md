@@ -42,11 +42,17 @@ via ONNX Runtime.
 | BiRefNet-lite fp16 (default) | 109 MB | MIT | Fast, good general quality |
 | BiRefNet base fp16 ("Quality") | 467 MB | MIT | Swin-Large; catches small/faint objects, needs 8+ GB RAM phones |
 | U2Netp | 4.4 MB | Apache-2.0 | Tiny and fast, lower quality |
+| MobileSAM encoder + decoder | 27 + 16 MB | Apache-2.0 | Optional "SAM" engine for the Smart/Snap selection modes |
 
 Both BiRefNet presets are fp16 conversions of the MIT-licensed weights with fp32
 inputs/outputs kept. Interface: input tensor `input_image`, 1024×1024, ImageNet
 normalization; output is logits, passed through sigmoid. You can also add any custom
 ONNX model by URL from the settings screen.
+
+The MobileSAM pair ([ChaoningZhang/MobileSAM](https://github.com/ChaoningZhang/MobileSAM),
+Apache-2.0) is not a background-removal model: it powers the prompt-based "SAM"
+selection engine (tap an object or draw a rough box on the selection screen) and is
+downloaded on first use of that engine.
 
 **Model hosting:** presets download from this repository's [GitHub Releases](https://github.com/dgocker/asset-slicer/releases). If you fork, attach the models to your own release and update the URLs in `src/App.tsx`. The
 models can be produced from the [onnx-community/BiRefNet-ONNX](https://huggingface.co/onnx-community/BiRefNet-ONNX)

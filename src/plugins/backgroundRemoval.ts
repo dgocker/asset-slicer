@@ -28,6 +28,36 @@ export interface RemoveBackgroundResult {
   path: string;
 }
 
+/** Точка-промпт MobileSAM (пиксели оригинала; label 1 = точка объекта). */
+export interface SamPoint {
+  x: number;
+  y: number;
+  label: number;
+}
+
+/** Рамка-промпт MobileSAM (пиксели оригинала, углы left-top / right-bottom). */
+export interface SamBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export interface SamPrepareResult {
+  /** Размеры листа, для которого посчитан embedding. */
+  width: number;
+  height: number;
+}
+
+export interface SamPromptResult {
+  /** PNG-маска (base64 без dataURL-префикса): белый непрозрачный = объект. */
+  maskBase64: string;
+  width: number;
+  height: number;
+  /** Предсказанный IoU маски (уверенность модели). */
+  iou: number;
+}
+
 export interface BackgroundRemovalPlugin {
   /**
    * Скачивает и кэширует ONNX-модель с поддержкой докачки (HTTP Range).
@@ -48,6 +78,29 @@ export interface BackgroundRemovalPlugin {
   }): Promise<RemoveBackgroundResult>;
 
   releaseModel(): Promise<void>;
+
+  /**
+   * Готовит MobileSAM для листа: кэширует сессии энкодера/декодера и считает
+   * embedding изображения (обе модели должны быть скачаны через preloadModel).
+   */
+  samPrepare(options: {
+    encoderUrl: string;
+    decoderUrl: string;
+    /** Лист: dataURL / base64 / uri — как в removeBackground. */
+    image: string;
+  }): Promise<SamPrepareResult>;
+
+  /**
+   * Сегментация по промпту (точки и/или рамка в пикселях оригинала)
+   * на embedding-е, посчитанном samPrepare.
+   */
+  samPrompt(options: {
+    points?: SamPoint[];
+    box?: SamBox;
+  }): Promise<SamPromptResult>;
+
+  /** Освобождает embedding листа (сессии SAM остаются прогретыми). */
+  samRelease(): Promise<void>;
 
   /**
    * Открывает системный выбор папки (SAF, ACTION_OPEN_DOCUMENT_TREE).

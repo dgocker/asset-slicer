@@ -46,6 +46,23 @@ weights.
 
 Full license text: see [Apache License 2.0](#apache-license-20) below.
 
+## MobileSAM (prompt-based selection engine)
+
+- License: **Apache License 2.0**
+- Copyright (c) 2023 Kyung Hee University (Chaoning Zhang et al.)
+- Source: <https://github.com/ChaoningZhang/MobileSAM>
+- Paper: "Faster Segment Anything: Towards Lightweight SAM for Mobile Applications"
+  (Zhang, Han, Zheng, Sun, Kweon, Hong et al., 2023)
+
+The optional "SAM" engine of the Smart and Snap selection modes downloads ONNX
+exports of MobileSAM at runtime (image encoder `mobilesam_encoder.onnx` and prompt
+decoder `mobilesam_decoder.onnx`, ~44 MB total) and runs them on-device with ONNX
+Runtime. The export/conversion does not change the licensing: the files remain under
+Apache-2.0. MobileSAM is a distilled variant of Meta AI's Segment Anything Model
+(SAM, also Apache-2.0, <https://github.com/facebookresearch/segment-anything>).
+
+Full license text: see [Apache License 2.0](#apache-license-20) below.
+
 ## Capacitor
 
 - License: **MIT**
@@ -92,7 +109,8 @@ SOFTWARE.
 
 ### Apache License 2.0
 
-Applies to: U-2-Net / u2netp (Copyright (c) 2020 Xuebin Qin et al.).
+Applies to: U-2-Net / u2netp (Copyright (c) 2020 Xuebin Qin et al.) and
+MobileSAM (Copyright (c) 2023 Kyung Hee University, Chaoning Zhang et al.).
 
 ```
                                  Apache License

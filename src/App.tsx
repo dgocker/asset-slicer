@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import {
   Scissors,
   Sparkles,
@@ -19,10 +19,15 @@ import {
 import { Capacitor } from '@capacitor/core';
 import { ColorRGB, Rect, ObjectAsset, SelectionItem, SelectionMask } from './types';
 import ImageUploader from './components/ImageUploader';
-import ObjectSelector from './components/ObjectSelector';
+import ObjectSelector, { SamEngine, SamStatus } from './components/ObjectSelector';
 import AssetGallery from './components/AssetGallery';
 import AssetEditor from './components/AssetEditor';
-import { BackgroundRemoval } from './plugins/backgroundRemoval';
+import {
+  BackgroundRemoval,
+  SamBox,
+  SamPoint,
+  SamPromptResult,
+} from './plugins/backgroundRemoval';
 import { useT, tGlobal, I18nKey } from './i18n';
 import {
   clampRectToBounds,
@@ -42,6 +47,16 @@ const BIREFNET_MODEL_SIZE_BYTES = 114538787;
 const BIREFNET_BASE_MODEL_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/birefnet_base_fp16.onnx';
 const BIREFNET_BASE_MODEL_SHA256 = '323232ec73a04ac4d0ef8c325a75aa8d69ed7062235a7cf9941769fae4c9709f';
 const BIREFNET_BASE_MODEL_SIZE_BYTES = 489666838;
+
+// MobileSAM (Apache-2.0) — движок выделения по промпту (точка/рамка) для
+// режимов «Умное» и «Прилипание» на экране выбора объектов; энкодер + декодер
+// скачиваются на устройство при первом SAM-действии (суммарно ~44 МБ)
+const SAM_ENCODER_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/mobilesam_encoder.onnx';
+const SAM_ENCODER_SHA256 = '20deef402855b31222b528f52b04807e41ebe47216ac0e39a0729f43491a0209';
+const SAM_ENCODER_SIZE_BYTES = 28157093;
+const SAM_DECODER_URL = 'https://github.com/dgocker/asset-slicer/releases/download/v1.0.0/mobilesam_decoder.onnx';
+const SAM_DECODER_SHA256 = '22cf85e35d14182f4b4712364264c06b22edbef63f065189586f080ef4e2f325';
+const SAM_DECODER_SIZE_BYTES = 16500272;
 
 /** SHA-256 известен только для наших моделей — для них включаем проверку. */
 const getSha256ForUrl = (url: string): string | undefined =>
@@ -803,6 +818,130 @@ export default function App() {
       setModelFetchInfo(null);
     }
   }, [customModelUrl, checkCustomModelCacheStatus]);
+
+  // --- SAM-движок выделения (MobileSAM) для экрана выбора объектов ---
+  const [samStatus, setSamStatus] = useState<SamStatus>({ phase: 'idle' });
+  /** src листа, для которого уже посчитан embedding (кэш samPrepare). */
+  const samPreparedForRef = useRef<string | null>(null);
+  /** Идущая подготовка — дедупликация конкурентных ensureSamReady. */
+  const samPreparePromiseRef = useRef<Promise<void> | null>(null);
+
+  /**
+   * Гарантирует готовность SAM для текущего листа: скачивает энкодер и декодер
+   * (с докачкой и байтовым прогрессом — суммарно ~44 МБ) и считает embedding
+   * листа (samPrepare). Результат кэшируется по src листа; вызывается лениво —
+   * при первом SAM-действии (или прогревом при переключении движка).
+   */
+  const ensureSamReady = useCallback(async (): Promise<void> => {
+    if (!Capacitor.isNativePlatform()) {
+      throw new Error(tGlobal('app.webAiUnsupported'));
+    }
+    const src = originalImageSrc;
+    if (!src) throw new Error('No sheet loaded');
+    if (samPreparedForRef.current === src) return;
+    if (samPreparePromiseRef.current) return samPreparePromiseRef.current;
+
+    const prepare = (async () => {
+      // 1. Модели: скачиваем недостающие с суммарным прогрессом в байтах
+      const files = [
+        { url: SAM_ENCODER_URL, sha256: SAM_ENCODER_SHA256, size: SAM_ENCODER_SIZE_BYTES },
+        { url: SAM_DECODER_URL, sha256: SAM_DECODER_SHA256, size: SAM_DECODER_SIZE_BYTES },
+      ];
+      const needed: typeof files = [];
+      for (const f of files) {
+        try {
+          const res = await BackgroundRemoval.isModelCached({ url: f.url });
+          if (!res.isCached) needed.push(f);
+        } catch {
+          needed.push(f);
+        }
+      }
+      if (needed.length > 0) {
+        const total = needed.reduce((s, f) => s + f.size, 0);
+        let doneBytes = 0;
+        setSamStatus({ phase: 'downloading', loaded: 0, total });
+        const listener = await BackgroundRemoval.addListener(
+          'modelDownloadProgress',
+          (info) => {
+            if (!info || typeof info.loaded !== 'number') return;
+            setSamStatus({
+              phase: 'downloading',
+              loaded: Math.min(total, doneBytes + info.loaded),
+              total,
+            });
+          }
+        );
+        try {
+          for (const f of needed) {
+            await BackgroundRemoval.preloadModel({ url: f.url, sha256: f.sha256 });
+            doneBytes += f.size;
+          }
+        } finally {
+          listener.remove();
+        }
+      }
+
+      // 2. Embedding листа («Анализ листа…»); нативному плагину нужен dataURL —
+      // blob:-URL из WebView он прочитать не может
+      setSamStatus({ phase: 'preparing' });
+      const img = await loadImage(src);
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas 2D context unavailable');
+      ctx.drawImage(img, 0, 0);
+      await BackgroundRemoval.samPrepare({
+        encoderUrl: SAM_ENCODER_URL,
+        decoderUrl: SAM_DECODER_URL,
+        image: canvas.toDataURL('image/png'),
+      });
+      samPreparedForRef.current = src;
+      setSamStatus({ phase: 'ready' });
+    })();
+
+    const guarded = prepare
+      .catch((e: any) => {
+        setSamStatus({ phase: 'error', error: e?.message || String(e) });
+        throw e;
+      })
+      .finally(() => {
+        samPreparePromiseRef.current = null;
+      });
+    samPreparePromiseRef.current = guarded;
+    return guarded;
+  }, [originalImageSrc]);
+
+  /** Промпт SAM (точки/рамка в пикселях листа); сам дожидается готовности. */
+  const samPrompt = useCallback(
+    async (options: { points?: SamPoint[]; box?: SamBox }): Promise<SamPromptResult> => {
+      await ensureSamReady();
+      return BackgroundRemoval.samPrompt(options);
+    },
+    [ensureSamReady]
+  );
+
+  const samEngine: SamEngine = useMemo(
+    () => ({
+      available: Capacitor.isNativePlatform(),
+      status: samStatus,
+      ensureReady: ensureSamReady,
+      prompt: samPrompt,
+    }),
+    [samStatus, ensureSamReady, samPrompt]
+  );
+
+  // Смена/сброс листа: embedding предыдущего листа освобождается на native
+  // (сессии SAM остаются прогретыми), статус подготовки сбрасывается
+  useEffect(() => {
+    return () => {
+      samPreparedForRef.current = null;
+      setSamStatus({ phase: 'idle' });
+      if (Capacitor.isNativePlatform()) {
+        BackgroundRemoval.samRelease().catch(() => {});
+      }
+    };
+  }, [originalImageSrc]);
 
   /**
    * Отмена с экрана 'processing': инкремент requestId инвалидирует все
@@ -1633,6 +1772,7 @@ export default function App() {
               onCancel={handleReset}
               onProcessObjects={processObjects}
               onProcessWholeSheet={processWholeSheet}
+              sam={samEngine}
             />
           ) : view === 'gallery' ? (
             /* Gallery of ready-made per-object assets (new main flow) */

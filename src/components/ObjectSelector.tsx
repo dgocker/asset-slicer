@@ -32,6 +32,7 @@ import {
   erodeBinary,
   clampRectToBounds,
 } from '../utils/objectDetect';
+import { SamBox, SamPoint, SamPromptResult } from '../plugins/backgroundRemoval';
 
 interface SelectionBox {
   id: string;
@@ -41,6 +42,31 @@ interface SelectionBox {
 }
 
 type SelectMode = 'auto' | 'manual' | 'snap' | 'smart';
+
+/** Движок «Умного» выделения и «Прилипания»: цветовая эвристика или MobileSAM. */
+export type SelectionEngine = 'color' | 'sam';
+
+export type SamPhase = 'idle' | 'downloading' | 'preparing' | 'ready' | 'error';
+
+/** Статус подготовки SAM (для бейджа прогресса над листом). */
+export interface SamStatus {
+  phase: SamPhase;
+  /** Скачано/всего байт (только для phase='downloading'). */
+  loaded?: number;
+  total?: number;
+  error?: string;
+}
+
+/** Мост SAM-движка из App (доступность, статус и вызовы плагина). */
+export interface SamEngine {
+  /** SAM доступен только в нативном приложении (Android). */
+  available: boolean;
+  status: SamStatus;
+  /** Скачивает модели (~44 МБ, с докачкой) и считает embedding текущего листа. */
+  ensureReady: () => Promise<void>;
+  /** Сегментация по промпту (пиксели оригинала); сама дожидается ensureReady. */
+  prompt: (options: { points?: SamPoint[]; box?: SamBox }) => Promise<SamPromptResult>;
+}
 
 type Corner = 'nw' | 'ne' | 'sw' | 'se';
 
@@ -72,6 +98,8 @@ interface ObjectSelectorProps {
     options: { excludeNested: boolean }
   ) => void;
   onProcessWholeSheet: () => void;
+  /** SAM-движок выделения (undefined/available=false — только «По цвету»). */
+  sam?: SamEngine;
 }
 
 /**
@@ -150,12 +178,101 @@ const SMART_PADDING_PX = 4; // отступ рамки вокруг контур
 const SMART_CONTOUR_BREATHE_PX = 10;
 const DETECT_MAX_DIM = 1600; // даунскейл детекции для больших фото
 
+/** Ключ localStorage выбранного движка выделения ('color' | 'sam'). */
+const ENGINE_STORAGE_KEY = 'selectionEngine';
+
+/** Загружает изображение из dataURL (декодирование PNG-маски SAM). */
+const loadMaskImage = (src: string): Promise<HTMLImageElement> =>
+  new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('SAM mask decode failed'));
+    img.src = src;
+  });
+
+/**
+ * Превращает PNG-маску SAM (в разрешении листа) в выделение:
+ * rect = bbox маски + паддинг SMART_PADDING_PX; mask вырезана по rect и
+ * дилатирована на 2px («воздух» под антиалиасинг ИИ-вырезания — SAM-маска
+ * и так идёт точно по объекту). rectOnly — подрежим «Рамкой»: bbox без маски.
+ * null — маска пуста (промпт попал в фон).
+ */
+async function samResultToSelection(
+  res: SamPromptResult,
+  W: number,
+  H: number,
+  rectOnly: boolean,
+): Promise<{ rect: Rect; mask?: SelectionMask } | null> {
+  const img = await loadMaskImage(`data:image/png;base64,${res.maskBase64}`);
+  const mw = img.naturalWidth;
+  const mh = img.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = mw;
+  canvas.height = mh;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('Canvas 2D context unavailable');
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0, 0, mw, mh).data;
+
+  // bbox непрозрачных пикселей (координаты маски)
+  let minX = mw, minY = mh, maxX = -1, maxY = -1;
+  for (let y = 0; y < mh; y++) {
+    const row = y * mw;
+    for (let x = 0; x < mw; x++) {
+      if (data[(row + x) * 4 + 3] > 127) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return null;
+
+  // Маска приходит в разрешении листа; на случай расхождения декодеров —
+  // явные коэффициенты маска→лист
+  const sx = mw / W;
+  const sy = mh / H;
+  const rect = clampRectToBounds(
+    {
+      x: minX / sx - SMART_PADDING_PX,
+      y: minY / sy - SMART_PADDING_PX,
+      width: (maxX - minX + 1) / sx + SMART_PADDING_PX * 2,
+      height: (maxY - minY + 1) / sy + SMART_PADDING_PX * 2,
+    },
+    W,
+    H,
+  );
+  if (rectOnly) return { rect };
+
+  // Маска в координатах rect (nearest) + dilate 2 для мягких краёв
+  const m = new Uint8Array(rect.width * rect.height);
+  for (let y = 0; y < rect.height; y++) {
+    const my = Math.max(0, Math.min(mh - 1, Math.floor((rect.y + y + 0.5) * sy)));
+    const mrow = my * mw;
+    const drow = y * rect.width;
+    for (let x = 0; x < rect.width; x++) {
+      const mx = Math.max(0, Math.min(mw - 1, Math.floor((rect.x + x + 0.5) * sx)));
+      if (data[(mrow + mx) * 4 + 3] > 127) m[drow + x] = 1;
+    }
+  }
+  return {
+    rect,
+    mask: {
+      data: dilateBinary(m, rect.width, rect.height, 2),
+      width: rect.width,
+      height: rect.height,
+    },
+  };
+}
+
 export default function ObjectSelector({
   imageSrc,
   initialSelections,
   onCancel,
   onProcessObjects,
   onProcessWholeSheet,
+  sam,
 }: ObjectSelectorProps) {
   const { t } = useT();
   const [image, setImage] = useState<HTMLImageElement | null>(null);
@@ -173,6 +290,36 @@ export default function ObjectSelector({
   useEffect(() => {
     smartVariantRef.current = smartVariant;
   }, [smartVariant]);
+
+  // Движок «Умного»/«Прилипания»: цветовая эвристика или SAM (только native)
+  const samAvailable = !!sam?.available;
+  const [engine, setEngineState] = useState<SelectionEngine>(() => {
+    try {
+      return localStorage.getItem(ENGINE_STORAGE_KEY) === 'sam' ? 'sam' : 'color';
+    } catch {
+      return 'color';
+    }
+  });
+  const effectiveEngine: SelectionEngine = samAvailable && engine === 'sam' ? 'sam' : 'color';
+  const setEngine = useCallback(
+    (next: SelectionEngine) => {
+      setEngineState(next);
+      try {
+        localStorage.setItem(ENGINE_STORAGE_KEY, next);
+      } catch {
+        /* ignore */
+      }
+      // Прогрев при переключении: скачивание моделей и анализ листа стартуют
+      // сразу, а не при первом тапе (ошибку покажет само SAM-действие)
+      if (next === 'sam' && sam?.available) {
+        sam.ensureReady().catch((e) => console.warn('SAM warmup failed:', e));
+      }
+    },
+    [sam],
+  );
+  // Идёт SAM-запрос (тап/рамка) — бейдж и защита от повторных жестов
+  const [samBusy, setSamBusy] = useState(false);
+  const samBusyRef = useRef(false);
 
   const imageRef = useRef<HTMLImageElement | null>(null);
   const masksRef = useRef<DetectionMasks | null>(null);
@@ -375,8 +522,32 @@ export default function ObjectSelector({
   });
 
   /**
-   * «Умный» тап: flood-fill связной fg-компоненты от точки тапа
-   * (по grown-маске автодетекции, контур уточняется closed-маской),
+   * Тап по уже выделенной контурной компоненте — снятие выделения.
+   * Общий шаг «умного» тапа обоих движков (цветового и SAM).
+   */
+  const tryDeselectMaskAt = useCallback(
+    (ptX: number, ptY: number): boolean => {
+      for (let i = boxes.length - 1; i >= 0; i--) {
+        const b = boxes[i];
+        if (!b.mask) continue;
+        const lx = Math.floor(ptX - b.rect.x);
+        const ly = Math.floor(ptY - b.rect.y);
+        if (
+          lx >= 0 && ly >= 0 && lx < b.mask.width && ly < b.mask.height &&
+          b.mask.data[ly * b.mask.width + lx] === 1
+        ) {
+          deleteBox(b.id);
+          return true;
+        }
+      }
+      return false;
+    },
+    [boxes, deleteBox],
+  );
+
+  /**
+   * «Умный» тап (цветовой движок): flood-fill связной fg-компоненты от точки
+   * тапа (по grown-маске автодетекции, контур уточняется closed-маской),
    * маска компоненты масштабируется к полному разрешению (nearest).
    * Повторный тап по уже выделенной компоненте снимает выделение.
    */
@@ -385,19 +556,7 @@ export default function ObjectSelector({
     if (!img) return;
 
     // 1. Тап по уже выделенной компоненте — снятие выделения
-    for (let i = boxes.length - 1; i >= 0; i--) {
-      const b = boxes[i];
-      if (!b.mask) continue;
-      const lx = Math.floor(ptX - b.rect.x);
-      const ly = Math.floor(ptY - b.rect.y);
-      if (
-        lx >= 0 && ly >= 0 && lx < b.mask.width && ly < b.mask.height &&
-        b.mask.data[ly * b.mask.width + lx] === 1
-      ) {
-        deleteBox(b.id);
-        return;
-      }
-    }
+    if (tryDeselectMaskAt(ptX, ptY)) return;
 
     const masks = masksRef.current;
     if (!masks) return;
@@ -563,7 +722,138 @@ export default function ObjectSelector({
       { id, rect, mask: { data, width: rect.width, height: rect.height } },
     ]);
     setSelectedId(id);
-  }, [boxes, deleteBox]);
+  }, [tryDeselectMaskAt]);
+
+  /** Цветовое «прилипание»: сжатие грубой рамки к bbox fg-пикселей внутри неё. */
+  const snapColorSelect = useCallback((drawn: Rect) => {
+    const img = imageRef.current;
+    if (!img) return;
+    const W = img.naturalWidth;
+    const H = img.naturalHeight;
+    let finalRect = drawn;
+    const masks = masksRef.current;
+    if (masks) {
+      const s = masks.scale;
+      const bbox = foregroundBBoxInRect(masks.closed, masks.width, masks.height, {
+        x: finalRect.x * s,
+        y: finalRect.y * s,
+        width: finalRect.width * s,
+        height: finalRect.height * s,
+      });
+      if (bbox) {
+        finalRect = clampRectToBounds(
+          {
+            x: bbox.x / s - SNAP_PADDING_PX,
+            y: bbox.y / s - SNAP_PADDING_PX,
+            width: bbox.width / s + SNAP_PADDING_PX * 2,
+            height: bbox.height / s + SNAP_PADDING_PX * 2,
+          },
+          W,
+          H,
+        );
+      }
+      // Если внутри пусто — рамка остаётся как нарисована
+    }
+    const id = makeBoxId('user');
+    setBoxes((prev) => [...prev, { id, rect: finalRect }]);
+    setSelectedId(id);
+  }, []);
+
+  /**
+   * Ошибка SAM (модель не скачана / OOM / нативный сбой): предлагаем выполнить
+   * тот же жест цветовым движком (сам движок пользователь переключает чипами).
+   */
+  const handleSamError = useCallback(
+    (e: unknown, colorFallback: () => void) => {
+      console.warn('SAM selection failed:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (window.confirm(t('selector.samErrorFallback', { error: msg }))) {
+        colorFallback();
+      }
+    },
+    [t],
+  );
+
+  /**
+   * «Умный» тап (движок SAM): точка-промпт → маска объекта по контуру.
+   * Подрежим «Рамкой» даёт bbox маски без контура. Пустая маска (тап по фону)
+   * молча игнорируется — как в цветовом режиме.
+   */
+  const handleSamSmartTap = useCallback(
+    async (ptX: number, ptY: number) => {
+      if (tryDeselectMaskAt(ptX, ptY)) return;
+      const img = imageRef.current;
+      if (!img || !sam || samBusyRef.current) return;
+      samBusyRef.current = true;
+      setSamBusy(true);
+      try {
+        await sam.ensureReady();
+        const res = await sam.prompt({
+          points: [{ x: Math.round(ptX), y: Math.round(ptY), label: 1 }],
+        });
+        const sel = await samResultToSelection(
+          res,
+          img.naturalWidth,
+          img.naturalHeight,
+          smartVariantRef.current === 'rect',
+        );
+        if (!sel) return; // промпт попал в фон
+        const id = makeBoxId(sel.mask ? 'smart' : 'user');
+        setBoxes((prev) => [...prev, { id, ...sel }]);
+        setSelectedId(id);
+      } catch (e) {
+        handleSamError(e, () => handleSmartTap(ptX, ptY));
+      } finally {
+        samBusyRef.current = false;
+        setSamBusy(false);
+      }
+    },
+    [sam, tryDeselectMaskAt, handleSamError, handleSmartTap],
+  );
+
+  /**
+   * «Прилипание» (движок SAM): грубая рамка как box-промпт → контурное
+   * выделение объекта внутри (апгрейд прилипания до маски). Пустая маска —
+   * рамка остаётся как нарисована (как у цветового прилипания без fg).
+   */
+  const handleSamBoxSelect = useCallback(
+    async (drawn: Rect) => {
+      const img = imageRef.current;
+      if (!img || !sam || samBusyRef.current) return;
+      const addPlainBox = () => {
+        const id = makeBoxId('user');
+        setBoxes((prev) => [...prev, { id, rect: drawn }]);
+        setSelectedId(id);
+      };
+      samBusyRef.current = true;
+      setSamBusy(true);
+      try {
+        await sam.ensureReady();
+        const res = await sam.prompt({
+          box: {
+            x0: Math.round(drawn.x),
+            y0: Math.round(drawn.y),
+            x1: Math.round(drawn.x + drawn.width),
+            y1: Math.round(drawn.y + drawn.height),
+          },
+        });
+        const sel = await samResultToSelection(res, img.naturalWidth, img.naturalHeight, false);
+        if (!sel) {
+          addPlainBox();
+          return;
+        }
+        const id = makeBoxId('smart');
+        setBoxes((prev) => [...prev, { id, ...sel }]);
+        setSelectedId(id);
+      } catch (e) {
+        handleSamError(e, () => snapColorSelect(drawn));
+      } finally {
+        samBusyRef.current = false;
+        setSamBusy(false);
+      }
+    },
+    [sam, handleSamError, snapColorSelect],
+  );
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     const img = imageRef.current;
@@ -706,7 +996,11 @@ export default function ObjectSelector({
         Math.abs(pt.x - drag.startX) <= threshold &&
         Math.abs(pt.y - drag.startY) <= threshold
       ) {
-        handleSmartTap(drag.startX, drag.startY);
+        if (effectiveEngine === 'sam') {
+          void handleSamSmartTap(drag.startX, drag.startY);
+        } else {
+          handleSmartTap(drag.startX, drag.startY);
+        }
       }
       return;
     }
@@ -722,33 +1016,17 @@ export default function ObjectSelector({
 
     const W = img.naturalWidth;
     const H = img.naturalHeight;
-    let finalRect = clampRectToBounds(draft, W, H);
+    const finalRect = clampRectToBounds(draft, W, H);
 
-    // Режим «Прилипание»: сжимаем грубую рамку к bbox fg-пикселей внутри неё
+    // Режим «Прилипание»: сжимаем грубую рамку к границам объекта внутри неё
+    // (движок SAM даёт контурную маску, цветовой — bbox fg-пикселей)
     if (mode === 'snap') {
-      const masks = masksRef.current;
-      if (masks) {
-        const s = masks.scale;
-        const bbox = foregroundBBoxInRect(masks.closed, masks.width, masks.height, {
-          x: finalRect.x * s,
-          y: finalRect.y * s,
-          width: finalRect.width * s,
-          height: finalRect.height * s,
-        });
-        if (bbox) {
-          finalRect = clampRectToBounds(
-            {
-              x: bbox.x / s - SNAP_PADDING_PX,
-              y: bbox.y / s - SNAP_PADDING_PX,
-              width: bbox.width / s + SNAP_PADDING_PX * 2,
-              height: bbox.height / s + SNAP_PADDING_PX * 2,
-            },
-            W,
-            H,
-          );
-        }
-        // Если внутри пусто — рамка остаётся как нарисована
+      if (effectiveEngine === 'sam') {
+        void handleSamBoxSelect(finalRect);
+      } else {
+        snapColorSelect(finalRect);
       }
+      return;
     }
 
     const id = makeBoxId('user');
@@ -783,8 +1061,26 @@ export default function ObjectSelector({
       : mode === 'manual'
         ? t('selector.hint.manual')
         : mode === 'snap'
-          ? t('selector.hint.snap')
-          : t('selector.hint.smart');
+          ? effectiveEngine === 'sam'
+            ? t('selector.hint.snapSam')
+            : t('selector.hint.snap')
+          : effectiveEngine === 'sam'
+            ? t('selector.hint.smartSam')
+            : t('selector.hint.smart');
+
+  // Бейдж состояния SAM над листом: скачивание моделей / анализ листа / запрос
+  const samStatus = sam?.status;
+  const samOverlayText =
+    samStatus?.phase === 'downloading'
+      ? t('sam.downloading', {
+          loaded: Math.round((samStatus.loaded || 0) / (1024 * 1024)),
+          total: Math.round((samStatus.total || 0) / (1024 * 1024)),
+        })
+      : samStatus?.phase === 'preparing'
+        ? t('sam.preparing')
+        : samBusy
+          ? t('sam.working')
+          : null;
 
   return (
     <div className="w-full flex flex-col gap-5 mt-2 max-w-7xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -866,6 +1162,30 @@ export default function ObjectSelector({
         </div>
 
         <p className="text-[11px] text-zinc-400 leading-relaxed -mt-2">{modeHint}</p>
+
+        {/* Движок «Умного»/«Прилипания»: цветовая эвристика или SAM (native) */}
+        {samAvailable && (mode === 'smart' || mode === 'snap') && (
+          <div className="flex items-center gap-2 -mt-1">
+            <span className="text-[11px] text-zinc-500 font-medium">{t('selector.engineLabel')}</span>
+            {([
+              { key: 'color', label: t('selector.engine.color') },
+              { key: 'sam', label: t('selector.engine.sam') },
+            ] as const).map(v => (
+              <button
+                key={v.key}
+                onClick={() => setEngine(v.key)}
+                aria-pressed={engine === v.key}
+                className={`py-1.5 px-3 rounded-full text-[11px] font-semibold border transition-all cursor-pointer active:scale-95 ${
+                  engine === v.key
+                    ? 'bg-violet-600/20 border-violet-500/50 text-violet-300'
+                    : 'bg-zinc-950/60 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                {v.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Подрежим «Умного» выделения: контур или рамка */}
         {mode === 'smart' && (
@@ -1000,6 +1320,14 @@ export default function ObjectSelector({
                 <div className="absolute top-3 left-3 z-30 bg-zinc-950/80 backdrop-blur-md border border-zinc-800 px-3 py-1.5 rounded-full flex items-center gap-2 text-xs font-semibold text-zinc-300 pointer-events-none">
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-400" />
                   {t('selector.detecting')}
+                </div>
+              )}
+
+              {/* SAM status badge (скачивание моделей / анализ листа / запрос) */}
+              {samOverlayText && (
+                <div className="absolute top-3 right-3 z-30 bg-zinc-950/80 backdrop-blur-md border border-zinc-800 px-3 py-1.5 rounded-full flex items-center gap-2 text-xs font-semibold text-zinc-300 pointer-events-none">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                  {samOverlayText}
                 </div>
               )}
             </div>
