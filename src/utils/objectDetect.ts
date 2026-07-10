@@ -435,7 +435,9 @@ export function foregroundBBoxInRect(
   }
   if (!any) return null;
 
-  const eroded = erodeBinary(sub, rw, rh, 2);
+  // Радиус размыкания пропорционален изображению (мосты теней ~1.2% стороны)
+  const openR = Math.max(2, Math.round(Math.min(width, height) * 0.012));
+  const eroded = erodeBinary(sub, rw, rh, openR);
   let target = sub;
   let hasEroded = false;
   for (let p = 0; p < eroded.length; p++) if (eroded[p] === 1) { hasEroded = true; break; }
@@ -462,7 +464,7 @@ export function foregroundBBoxInRect(
     }
     const main = new Uint8Array(rw * rh);
     for (let p = 0; p < rw * rh; p++) if (labels[p] === bestLabel) main[p] = 1;
-    const restored = dilateBinary(main, rw, rh, 3);
+    const restored = dilateBinary(main, rw, rh, openR + 1);
     const combined = new Uint8Array(rw * rh);
     let cnt = 0;
     for (let p = 0; p < rw * rh; p++) if (restored[p] === 1 && sub[p] === 1) { combined[p] = 1; cnt++; }

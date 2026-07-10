@@ -443,9 +443,13 @@ export default function ObjectSelector({
     // синий и зелёный). Эрозия r=2 рвёт мостики; берём только компоненту
     // под пальцем и восстанавливаем её дилатацией в пределах исходной маски.
     {
-      const eroded = erodeBinary(tightMask, masks.width, masks.height, 2);
+      // Радиус пропорционален изображению: мосты теней масштабируются вместе
+      // с листом (замер на реальном кейсе: мост ~16px при ширине листа 704 →
+      // нужен r≈8, т.е. ~1.2% меньшей стороны)
+      const neckR = Math.max(2, Math.round(Math.min(masks.width, masks.height) * 0.012));
+      const eroded = erodeBinary(tightMask, masks.width, masks.height, neckR);
       let sx = -1, sy = -1;
-      outer: for (let r = 0; r <= 8; r++) {
+      outer: for (let r = 0; r <= neckR + 8; r++) {
         for (let dy = -r; dy <= r; dy++) {
           for (let dx = -r; dx <= r; dx++) {
             if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
@@ -461,7 +465,7 @@ export default function ObjectSelector({
       if (sx >= 0) {
         const sub = floodFillComponentMask(eroded, masks.width, masks.height, sx, sy);
         if (sub) {
-          const restored = dilateBinary(sub.data, masks.width, masks.height, 3);
+          const restored = dilateBinary(sub.data, masks.width, masks.height, neckR + 1);
           const cut = new Uint8Array(tightMask.length);
           let cnt = 0;
           let cMinX = masks.width, cMinY = masks.height, cMaxX = -1, cMaxY = -1;
