@@ -1014,6 +1014,44 @@ export default function App() {
     [samStatus, ensureSamReady, samPrompt]
   );
 
+  /**
+   * «Консилиум» (ИИ-инспектор): независимая SAM-маска объекта по рамке для
+   * сверки с альфой BiRefNet. null — SAM не подготовлен для ТЕКУЩЕГО листа
+   * (эмбеддинг специально не готовим: инспекция бесплатна только с кэшем).
+   */
+  const samInspectRef = useRef<((rect: Rect) => Promise<Uint8Array | null>) | null>(null);
+  useEffect(() => {
+    samInspectRef.current = async (rect: Rect) => {
+      if (!Capacitor.isNativePlatform()) return null;
+      if (!originalImageSrc || samPreparedForRef.current !== originalImageSrc) return null;
+      try {
+        const res = await BackgroundRemoval.samPrompt({
+          box: {
+            x0: Math.round(rect.x),
+            y0: Math.round(rect.y),
+            x1: Math.round(rect.x + rect.width),
+            y1: Math.round(rect.y + rect.height),
+          },
+        });
+        const img = await loadImage(`data:image/png;base64,${res.maskBase64}`);
+        const c = document.createElement('canvas');
+        c.width = img.naturalWidth;
+        c.height = img.naturalHeight;
+        const cx = c.getContext('2d', { willReadFrequently: true });
+        if (!cx) return null;
+        cx.drawImage(img, 0, 0);
+        const rw = Math.round(rect.width), rh = Math.round(rect.height);
+        // за пределами канваса getImageData отдаёт прозрачный чёрный — это фон
+        const d = cx.getImageData(Math.round(rect.x), Math.round(rect.y), rw, rh).data;
+        const out = new Uint8Array(rw * rh);
+        for (let p = 0; p < rw * rh; p++) if (d[p * 4 + 3] > 127) out[p] = 1;
+        return out;
+      } catch (e) {
+        return null;
+      }
+    };
+  }, [originalImageSrc]);
+
   // Смена/сброс листа: embedding предыдущего листа освобождается на native
   // (сессии SAM остаются прогретыми), статус подготовки сбрасывается
   useEffect(() => {
@@ -1139,6 +1177,118 @@ export default function App() {
           }
         : null;
 
+    /** «Консилиум»: SAM независимо смотрит на рамку и судит альфу BiRefNet.
+     *  Решения принимает нейросеть, а не пороги: дефекты внутри SAM-тела
+     *  восстанавливаются, альфа вне SAM-тела убирается, при сильном
+     *  расхождении — честная пометка на карточке. */
+    let inspectionNote: string | undefined;
+    const consensusInspect = async (imgData: ImageData): Promise<void> => {
+      const inspect = samInspectRef.current;
+      if (!inspect) return;
+      const S = await inspect(rect);
+      const w = imgData.width, h = imgData.height;
+      if (!S || S.length !== w * h) return;
+      let sArea = 0;
+      for (let p = 0; p < S.length; p++) if (S[p] === 1) sArea++;
+      if (sArea < 64) return; // SAM объект не увидел — не судим
+      const inner = erodeBinary(S, w, h, 3);
+      const outer = dilateBinary(S, w, h, Math.max(6, Math.round(Math.min(w, h) * 0.02)));
+      const data = imgData.data;
+      let fixed = 0, removed = 0;
+
+      // 1) Дефекты: пятна alpha<200 глубоко внутри SAM-тела → восстановление
+      //    из оригинала (кап 15% тела спасает настоящие сквозные отверстия)
+      const defect = new Uint8Array(w * h);
+      for (let p = 0; p < w * h; p++) {
+        if (inner[p] === 1 && data[p * 4 + 3] < 200) defect[p] = 1;
+      }
+      const labels = new Int32Array(w * h);
+      const queue = new Int32Array(w * h);
+      let origData: Uint8ClampedArray | null = null;
+      let n = 0;
+      const maxDefect = Math.max(64, Math.round(sArea * 0.15));
+      for (let start = 0; start < w * h; start++) {
+        if (defect[start] !== 1 || labels[start] !== 0) continue;
+        n++;
+        const comp: number[] = [];
+        labels[start] = n;
+        let qh = 0, qt = 0;
+        queue[qt++] = start;
+        while (qh < qt) {
+          const p = queue[qh++];
+          comp.push(p);
+          const px = p % w, py = (p / w) | 0;
+          const tryP = (np: number) => {
+            if (defect[np] === 1 && labels[np] === 0) { labels[np] = n; queue[qt++] = np; }
+          };
+          if (px > 0) tryP(p - 1);
+          if (px < w - 1) tryP(p + 1);
+          if (py > 0) tryP(p - w);
+          if (py < h - 1) tryP(p + w);
+        }
+        if (comp.length > maxDefect) continue;
+        if (!origData) {
+          const oc = cropToCanvas(img, rect);
+          const octx = oc.getContext('2d', { willReadFrequently: true });
+          if (!octx) return;
+          origData = octx.getImageData(0, 0, w, h).data;
+        }
+        for (const p of comp) {
+          data[p * 4] = origData[p * 4];
+          data[p * 4 + 1] = origData[p * 4 + 1];
+          data[p * 4 + 2] = origData[p * 4 + 2];
+          data[p * 4 + 3] = 255;
+        }
+        fixed++;
+      }
+
+      // 2) Чужаки: непрозрачные компоненты ПОЛНОСТЬЮ вне расширенного SAM-тела
+      const solid = new Uint8Array(w * h);
+      for (let p = 0; p < w * h; p++) if (data[p * 4 + 3] > 127) solid[p] = 1;
+      const labels2 = new Int32Array(w * h);
+      let m = 0;
+      for (let start = 0; start < w * h; start++) {
+        if (solid[start] !== 1 || labels2[start] !== 0) continue;
+        m++;
+        const comp: number[] = [];
+        let touches = false;
+        labels2[start] = m;
+        let qh = 0, qt = 0;
+        queue[qt++] = start;
+        while (qh < qt) {
+          const p = queue[qh++];
+          comp.push(p);
+          if (outer[p] === 1) touches = true;
+          const px = p % w, py = (p / w) | 0;
+          const tryP = (np: number) => {
+            if (solid[np] === 1 && labels2[np] === 0) { labels2[np] = m; queue[qt++] = np; }
+          };
+          if (px > 0) tryP(p - 1);
+          if (px < w - 1) tryP(p + 1);
+          if (py > 0) tryP(p - w);
+          if (py < h - 1) tryP(p + w);
+        }
+        if (!touches) {
+          for (const p of comp) data[p * 4 + 3] = 0;
+          removed++;
+        }
+      }
+
+      // 3) Доверие: IoU альфы и SAM-маски
+      let inter = 0, uni = 0;
+      for (let p = 0; p < w * h; p++) {
+        const a = data[p * 4 + 3] > 127 ? 1 : 0;
+        if (a === 1 && S[p] === 1) inter++;
+        if (a === 1 || S[p] === 1) uni++;
+      }
+      const iou = uni > 0 ? inter / uni : 0;
+      if (fixed > 0 || removed > 0) {
+        inspectionNote = tGlobal('inspector.fixed', { n: fixed + removed });
+      } else if (iou < 0.5) {
+        inspectionNote = tGlobal('inspector.lowConfidence');
+      }
+    };
+
     /** Пост-обработка результата в координатах rect: маска контура ∩, trim.
      *  (Вычитание вложенных объектов делается пост-проходом в processObjects —
      *  по ГОТОВОЙ альфе вложенного объекта, а не по хрупкой маске цвета.) */
@@ -1158,6 +1308,8 @@ export default function App() {
       // (кейс: чёрные точки внутри камней). RGB для заливки — из оригинала
       // листа: в PNG у прозрачных пикселей цвет обнулён premultiply-ем.
       fillSmallAlphaHoles(imgData, img, rect);
+      // «Консилиум»: SAM судит результат (только если эмбеддинг листа готов)
+      await consensusInspect(imgData);
       ctx.putImageData(imgData, 0, 0);
       return trimCanvasTransparent(canvas);
     };
@@ -1190,7 +1342,7 @@ export default function App() {
       aiResultCacheRef.current.push({ rect, canvas: cloneCanvas(aiCanvas) });
       if (aiResultCacheRef.current.length > 8) aiResultCacheRef.current.shift();
       let result = await finalizeCanvas(aiCanvas, true);
-      if (result) return result;
+      if (result) return inspectionNote ? { ...result, note: inspectionNote } : result;
 
       // --- Шаг 2: ретрай с контекстом — рамка ×1.6 от центра ---
       const expanded = expandRectFromCenter(rect, 1.6, img.naturalWidth, img.naturalHeight);
@@ -1199,7 +1351,7 @@ export default function App() {
         const expRaw = await runAIOnCanvas(expCrop);
         const expCanvas = await blobToSizedCanvas(expRaw, expCrop.width, expCrop.height);
         result = await finalizeCanvas(cutRectFrom(expCanvas, expanded), true);
-        if (result) return result;
+        if (result) return inspectionNote ? { ...result, note: inspectionNote } : result;
       }
 
       // --- Шаг 2.4: объект из ГОТОВОГО ИИ-результата охватывающей рамки ---
@@ -1210,7 +1362,7 @@ export default function App() {
         if (entry.rect === rect) continue;
         if (rectIntersectionArea(entry.rect, rect) < 0.98 * rectArea) continue;
         result = await finalizeCanvas(cutRectFrom(entry.canvas, entry.rect), true);
-        if (result) return result;
+        if (result) return inspectionNote ? { ...result, note: inspectionNote } : result;
       }
 
       // --- Шаг 2.5: ИИ по региону всех выделений (кэш) — модель видит объект в
@@ -1224,7 +1376,7 @@ export default function App() {
         );
         const { region: srcRect, canvas: regionCanvas } = await getRegionAICanvas(img, region);
         result = await finalizeCanvas(cutRectFrom(regionCanvas, srcRect), true);
-        if (result) return result;
+        if (result) return inspectionNote ? { ...result, note: inspectionNote } : result;
       } catch (e) {
         // регион слишком большой / ИИ упал — тихо падаем на цветовой фолбэк
         console.warn('Region AI fallback failed:', e);
