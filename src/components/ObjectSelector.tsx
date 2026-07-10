@@ -29,6 +29,7 @@ import {
   foregroundBBoxInRect,
   floodFillComponentMask,
   dilateBinary,
+  erodeBinary,
   clampRectToBounds,
 } from '../utils/objectDetect';
 
@@ -431,11 +432,60 @@ export default function ObjectSelector({
         }
       }
     }
-    const tightMask = refinedCount > 0 ? refined : comp.data;
-    const tightBBox: Rect =
+    let tightMask = refinedCount > 0 ? refined : comp.data;
+    let tightBBox: Rect =
       refinedCount > 0
         ? { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 }
         : comp.bbox;
+
+    // Разрыв тонких перемычек: соседние объекты соединяются мостиками
+    // перекрывающихся теней/полутонов (кейс: тап по красному камню тянул
+    // синий и зелёный). Эрозия r=2 рвёт мостики; берём только компоненту
+    // под пальцем и восстанавливаем её дилатацией в пределах исходной маски.
+    {
+      const eroded = erodeBinary(tightMask, masks.width, masks.height, 2);
+      let sx = -1, sy = -1;
+      outer: for (let r = 0; r <= 8; r++) {
+        for (let dy = -r; dy <= r; dy++) {
+          for (let dx = -r; dx <= r; dx++) {
+            if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+            const nx = mx + dx, ny = my + dy;
+            if (nx >= 0 && ny >= 0 && nx < masks.width && ny < masks.height &&
+                eroded[ny * masks.width + nx] === 1) {
+              sx = nx; sy = ny;
+              break outer;
+            }
+          }
+        }
+      }
+      if (sx >= 0) {
+        const sub = floodFillComponentMask(eroded, masks.width, masks.height, sx, sy);
+        if (sub) {
+          const restored = dilateBinary(sub.data, masks.width, masks.height, 3);
+          const cut = new Uint8Array(tightMask.length);
+          let cnt = 0;
+          let cMinX = masks.width, cMinY = masks.height, cMaxX = -1, cMaxY = -1;
+          for (let y = 0; y < masks.height; y++) {
+            const row = y * masks.width;
+            for (let x = 0; x < masks.width; x++) {
+              const p = row + x;
+              if (restored[p] === 1 && tightMask[p] === 1) {
+                cut[p] = 1;
+                cnt++;
+                if (x < cMinX) cMinX = x;
+                if (x > cMaxX) cMaxX = x;
+                if (y < cMinY) cMinY = y;
+                if (y > cMaxY) cMaxY = y;
+              }
+            }
+          }
+          if (cnt > 0) {
+            tightMask = cut;
+            tightBBox = { x: cMinX, y: cMinY, width: cMaxX - cMinX + 1, height: cMaxY - cMinY + 1 };
+          }
+        }
+      }
+    }
 
     const W = img.naturalWidth;
     const H = img.naturalHeight;

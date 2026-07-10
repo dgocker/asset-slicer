@@ -400,7 +400,12 @@ export function detectComponentRects(
 }
 
 /**
- * BBox fg-пикселей внутри прямоугольника (координаты маски).
+ * BBox ГЛАВНОГО объекта внутри прямоугольника (координаты маски).
+ * «Прилипание» должно липнуть к основному объекту, а не к сумме всего
+ * не-фона в окне: перемычки теней между соседями и мелкие блёстки
+ * растягивали bbox мимо объекта. Морфологическое размыкание (эрозия r=2)
+ * рвёт тонкие мостики и стирает мелочь, берётся крупнейшая связная
+ * компонента, восстановленная дилатацией в пределах исходной маски.
  * Возвращает null, если внутри нет ни одного fg-пикселя.
  */
 export function foregroundBBoxInRect(
@@ -413,16 +418,66 @@ export function foregroundBBoxInRect(
   const y0 = Math.max(0, Math.floor(rect.y));
   const x1 = Math.min(width, Math.ceil(rect.x + rect.width));
   const y1 = Math.min(height, Math.ceil(rect.y + rect.height));
+  const rw = x1 - x0;
+  const rh = y1 - y0;
+  if (rw <= 0 || rh <= 0) return null;
 
-  let minX = x1;
-  let minY = y1;
-  let maxX = x0 - 1;
-  let maxY = y0 - 1;
+  const sub = new Uint8Array(rw * rh);
+  let any = false;
+  for (let y = 0; y < rh; y++) {
+    const row = (y0 + y) * width;
+    for (let x = 0; x < rw; x++) {
+      if (mask[row + x0 + x] === 1) {
+        sub[y * rw + x] = 1;
+        any = true;
+      }
+    }
+  }
+  if (!any) return null;
 
-  for (let y = y0; y < y1; y++) {
-    const row = y * width;
-    for (let x = x0; x < x1; x++) {
-      if (mask[row + x] === 1) {
+  const eroded = erodeBinary(sub, rw, rh, 2);
+  let target = sub;
+  let hasEroded = false;
+  for (let p = 0; p < eroded.length; p++) if (eroded[p] === 1) { hasEroded = true; break; }
+  if (hasEroded) {
+    const labels = new Int32Array(rw * rh);
+    const queue = new Int32Array(rw * rh);
+    let bestLabel = 0, bestArea = 0, n = 0;
+    for (let start = 0; start < rw * rh; start++) {
+      if (eroded[start] !== 1 || labels[start] !== 0) continue;
+      n++;
+      labels[start] = n;
+      let qh = 0, qt = 0, area = 0;
+      queue[qt++] = start;
+      while (qh < qt) {
+        const p = queue[qh++];
+        area++;
+        const px = p % rw, py = (p / rw) | 0;
+        if (px > 0 && eroded[p - 1] === 1 && labels[p - 1] === 0) { labels[p - 1] = n; queue[qt++] = p - 1; }
+        if (px < rw - 1 && eroded[p + 1] === 1 && labels[p + 1] === 0) { labels[p + 1] = n; queue[qt++] = p + 1; }
+        if (py > 0 && eroded[p - rw] === 1 && labels[p - rw] === 0) { labels[p - rw] = n; queue[qt++] = p - rw; }
+        if (py < rh - 1 && eroded[p + rw] === 1 && labels[p + rw] === 0) { labels[p + rw] = n; queue[qt++] = p + rw; }
+      }
+      if (area > bestArea) { bestArea = area; bestLabel = n; }
+    }
+    const main = new Uint8Array(rw * rh);
+    for (let p = 0; p < rw * rh; p++) if (labels[p] === bestLabel) main[p] = 1;
+    const restored = dilateBinary(main, rw, rh, 3);
+    const combined = new Uint8Array(rw * rh);
+    let cnt = 0;
+    for (let p = 0; p < rw * rh; p++) if (restored[p] === 1 && sub[p] === 1) { combined[p] = 1; cnt++; }
+    if (cnt > 0) target = combined;
+  }
+
+  let minX = rw;
+  let minY = rh;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < rh; y++) {
+    const row = y * rw;
+    for (let x = 0; x < rw; x++) {
+      if (target[row + x] === 1) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -430,9 +485,8 @@ export function foregroundBBoxInRect(
       }
     }
   }
-
-  if (maxX < minX || maxY < minY) return null;
-  return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
+  if (maxX < 0) return null;
+  return { x: x0 + minX, y: y0 + minY, width: maxX - minX + 1, height: maxY - minY + 1 };
 }
 
 /**
