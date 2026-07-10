@@ -202,6 +202,7 @@ async function samResultToSelection(
   W: number,
   H: number,
   rectOnly: boolean,
+  seed?: { x: number; y: number },
 ): Promise<{ rect: Rect; mask?: SelectionMask } | null> {
   const img = await loadMaskImage(`data:image/png;base64,${res.maskBase64}`);
   const mw = img.naturalWidth;
@@ -213,6 +214,8 @@ async function samResultToSelection(
   if (!ctx) throw new Error('Canvas 2D context unavailable');
   ctx.drawImage(img, 0, 0);
   const data = ctx.getImageData(0, 0, mw, mh).data;
+  const sx = mw / W;
+  const sy = mh / H;
 
   // bbox непрозрачных пикселей (координаты маски)
   let minX = mw, minY = mh, maxX = -1, maxY = -1;
@@ -229,37 +232,112 @@ async function samResultToSelection(
   }
   if (maxX < 0) return null;
 
-  // Маска приходит в разрешении листа; на случай расхождения декодеров —
-  // явные коэффициенты маска→лист
-  const sx = mw / W;
-  const sy = mh / H;
+  // Локальное окно bbox: фильтр компонент — SAM-маска иногда прихватывает
+  // отдельные островки рядом (кейс: блёстка ✦ возле камня). Оставляем
+  // компоненту под точкой тапа (point-промпт) либо крупнейшую (box-промпт).
+  const bw = maxX - minX + 1;
+  const bh = maxY - minY + 1;
+  const local = new Uint8Array(bw * bh);
+  for (let y = 0; y < bh; y++) {
+    const mrow = (minY + y) * mw;
+    const drow = y * bw;
+    for (let x = 0; x < bw; x++) {
+      if (data[(mrow + minX + x) * 4 + 3] > 127) local[drow + x] = 1;
+    }
+  }
+  const labels = new Int32Array(bw * bh);
+  const queue = new Int32Array(bw * bh);
+  let nLabels = 0;
+  const areas: number[] = [0];
+  for (let start = 0; start < bw * bh; start++) {
+    if (local[start] !== 1 || labels[start] !== 0) continue;
+    nLabels++;
+    areas.push(0);
+    labels[start] = nLabels;
+    let qh = 0, qt = 0;
+    queue[qt++] = start;
+    while (qh < qt) {
+      const p = queue[qh++];
+      areas[nLabels]++;
+      const px = p % bw, py = (p / bw) | 0;
+      if (px > 0 && local[p - 1] === 1 && labels[p - 1] === 0) { labels[p - 1] = nLabels; queue[qt++] = p - 1; }
+      if (px < bw - 1 && local[p + 1] === 1 && labels[p + 1] === 0) { labels[p + 1] = nLabels; queue[qt++] = p + 1; }
+      if (py > 0 && local[p - bw] === 1 && labels[p - bw] === 0) { labels[p - bw] = nLabels; queue[qt++] = p - bw; }
+      if (py < bh - 1 && local[p + bw] === 1 && labels[p + bw] === 0) { labels[p + bw] = nLabels; queue[qt++] = p + bw; }
+    }
+  }
+  let keep = 0;
+  if (seed) {
+    const lx = Math.max(0, Math.min(bw - 1, Math.round(seed.x * sx) - minX));
+    const ly = Math.max(0, Math.min(bh - 1, Math.round(seed.y * sy) - minY));
+    keep = labels[ly * bw + lx];
+    // тап мог попасть в дырку маски — ищем ближайшую компоненту по спирали
+    if (keep === 0) {
+      outer: for (let r = 1; r <= 16; r++) {
+        for (let dy = -r; dy <= r; dy++) {
+          for (let dx = -r; dx <= r; dx++) {
+            if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+            const nx = lx + dx, ny = ly + dy;
+            if (nx >= 0 && ny >= 0 && nx < bw && ny < bh && labels[ny * bw + nx] > 0) {
+              keep = labels[ny * bw + nx];
+              break outer;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (keep === 0) {
+    let bestArea = 0;
+    for (let l = 1; l <= nLabels; l++) if (areas[l] > bestArea) { bestArea = areas[l]; keep = l; }
+  }
+
+  // bbox выбранной компоненты
+  let kMinX = bw, kMinY = bh, kMaxX = -1, kMaxY = -1;
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      if (labels[y * bw + x] === keep) {
+        if (x < kMinX) kMinX = x;
+        if (x > kMaxX) kMaxX = x;
+        if (y < kMinY) kMinY = y;
+        if (y > kMaxY) kMaxY = y;
+      }
+    }
+  }
+  if (kMaxX < 0) return null;
+
+  // «Воздух» пропорционально листу — как у цветового контура (не «в облипочку»;
+  // заодно прячет зубчики 256-сетки SAM, местами врезавшиеся внутрь объекта)
+  const breathe = Math.max(4, Math.round(Math.min(W, H) * 0.008));
   const rect = clampRectToBounds(
     {
-      x: minX / sx - SMART_PADDING_PX,
-      y: minY / sy - SMART_PADDING_PX,
-      width: (maxX - minX + 1) / sx + SMART_PADDING_PX * 2,
-      height: (maxY - minY + 1) / sy + SMART_PADDING_PX * 2,
+      x: (minX + kMinX) / sx - breathe - SMART_PADDING_PX,
+      y: (minY + kMinY) / sy - breathe - SMART_PADDING_PX,
+      width: (kMaxX - kMinX + 1) / sx + (breathe + SMART_PADDING_PX) * 2,
+      height: (kMaxY - kMinY + 1) / sy + (breathe + SMART_PADDING_PX) * 2,
     },
     W,
     H,
   );
   if (rectOnly) return { rect };
 
-  // Маска в координатах rect (nearest) + dilate 2 для мягких краёв
+  // Маска выбранной компоненты в координатах rect (nearest) + breathe-дилатация
   const m = new Uint8Array(rect.width * rect.height);
   for (let y = 0; y < rect.height; y++) {
     const my = Math.max(0, Math.min(mh - 1, Math.floor((rect.y + y + 0.5) * sy)));
-    const mrow = my * mw;
     const drow = y * rect.width;
     for (let x = 0; x < rect.width; x++) {
       const mx = Math.max(0, Math.min(mw - 1, Math.floor((rect.x + x + 0.5) * sx)));
-      if (data[(mrow + mx) * 4 + 3] > 127) m[drow + x] = 1;
+      const lx = mx - minX, ly = my - minY;
+      if (lx >= 0 && ly >= 0 && lx < bw && ly < bh && labels[ly * bw + lx] === keep) {
+        m[drow + x] = 1;
+      }
     }
   }
   return {
     rect,
     mask: {
-      data: dilateBinary(m, rect.width, rect.height, 2),
+      data: dilateBinary(m, rect.width, rect.height, breathe),
       width: rect.width,
       height: rect.height,
     },
@@ -796,6 +874,7 @@ export default function ObjectSelector({
           img.naturalWidth,
           img.naturalHeight,
           smartVariantRef.current === 'rect',
+          { x: ptX, y: ptY }, // компонента под пальцем, островки — вон
         );
         if (!sel) return; // промпт попал в фон
         const id = makeBoxId(sel.mask ? 'smart' : 'user');
