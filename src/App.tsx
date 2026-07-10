@@ -1181,20 +1181,26 @@ export default function App() {
     // (шаги 1–2.5, включая скачивание модели) пропускается: сразу вырез
     // по цвету фона листа (шаг 3).
     if (useAIBgRemoval) {
-      // --- Шаг 1: ИИ по исходной рамке ---
-      const cropCanvas = cropToCanvas(img, rect);
-      const rawBlob = await runAIOnCanvas(cropCanvas);
-      const aiCanvas = await blobToSizedCanvas(rawBlob, cropCanvas.width, cropCanvas.height);
+      // --- Шаг 1: ИИ по рамке С ЗАПАСОМ ФОНА (×1.5 = +25% с каждой стороны) ---
+      // Гипотеза пользователя, подтверждена экспериментом: в тесном кропе
+      // салиентной модели не с чем сравнивать объект, и она ищет «фон» ВНУТРИ
+      // него — дыры на тёмных гранях. Запас фона убирает дыры в источнике
+      // (замер: red 1→0, blue 2→0 дефектов при +25%). Из результата
+      // вырезается только зона исходной рамки.
+      const ctxRect = expandRectFromCenter(rect, 1.5, img.naturalWidth, img.naturalHeight);
+      const ctxCrop = cropToCanvas(img, ctxRect);
+      const rawBlob = await runAIOnCanvas(ctxCrop);
+      const ctxCanvas = await blobToSizedCanvas(rawBlob, ctxCrop.width, ctxCrop.height);
       // Чистый ИИ-результат — в кэш прогона (ступень 2.4 для вложенных рамок);
-      // клон, т.к. finalize мутирует канвас маской «умного» выделения
-      aiResultCacheRef.current.push({ rect, canvas: cloneCanvas(aiCanvas) });
+      // клон, т.к. дальше канвас мутируется
+      aiResultCacheRef.current.push({ rect: ctxRect, canvas: cloneCanvas(ctxCanvas) });
       if (aiResultCacheRef.current.length > 8) aiResultCacheRef.current.shift();
-      let result = await finalizeCanvas(aiCanvas, true);
+      let result = await finalizeCanvas(cutRectFrom(ctxCanvas, ctxRect), true);
       if (result) return result;
 
-      // --- Шаг 2: ретрай с контекстом — рамка ×1.6 от центра ---
-      const expanded = expandRectFromCenter(rect, 1.6, img.naturalWidth, img.naturalHeight);
-      if (expanded.width > rect.width || expanded.height > rect.height) {
+      // --- Шаг 2: ретрай с БОЛЬШИМ контекстом — рамка ×2.2 от центра ---
+      const expanded = expandRectFromCenter(rect, 2.2, img.naturalWidth, img.naturalHeight);
+      if (expanded.width > ctxRect.width || expanded.height > ctxRect.height) {
         const expCrop = cropToCanvas(img, expanded);
         const expRaw = await runAIOnCanvas(expCrop);
         const expCanvas = await blobToSizedCanvas(expRaw, expCrop.width, expCrop.height);
